@@ -1,0 +1,118 @@
+import type { Metadata, Viewport } from "next";
+// Self-hosted fonts: these wrap next/font/local with woff2 files shipped in the npm
+// package, so `next build` never reaches fonts.googleapis.com. Required for offline builds.
+import { GeistMono } from "geist/font/mono";
+import { GeistSans } from "geist/font/sans";
+import { ThemeProvider } from "next-themes";
+import { Toaster } from "@/components/ui/sonner";
+import { ServiceWorkerRegistration } from "@/components/pwa/ServiceWorkerRegistration";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "LLM Wiki",
+  description: "Free, open-source implementation of Karpathy's LLM Wiki. Upload documents and build a compounding wiki directly via Claude.",
+  metadataBase: new URL("https://llmwiki.app"),
+  manifest: "/manifest.webmanifest",
+  icons: {
+    icon: [
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/icon-192x192.png", sizes: "192x192", type: "image/png" },
+    ],
+    apple: [
+      {
+        url: "/apple-touch-icon.png",
+        sizes: "180x180",
+        type: "image/png",
+      },
+    ],
+  },
+  appleWebApp: {
+    capable: true,
+    title: "LLM Wiki",
+    statusBarStyle: "default",
+  },
+  openGraph: {
+    title: "LLM Wiki",
+    description: "Free, open-source implementation of Karpathy's LLM Wiki. Upload documents and build a compounding wiki directly via Claude.",
+    url: "https://llmwiki.app",
+    siteName: "LLM Wiki",
+    type: "website",
+    images: [{ url: "/og.png", width: 1200, height: 630, alt: "LLM Wiki" }],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "LLM Wiki",
+    description: "Free, open-source implementation of Karpathy's LLM Wiki. Upload documents and build a compounding wiki directly via Claude.",
+    images: ["/og.png"],
+  },
+  // Tells the Chrome extension's content script to stand down on any wiki host.
+  other: {
+    "llmwiki-app": "true",
+  },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f5f5f4" },
+    { media: "(prefers-color-scheme: dark)", color: "#0c0a09" },
+  ],
+};
+
+// Runs before hydration to prevent a theme flash; storageKey must match ThemeProvider's.
+const themeScript = `
+  (function() {
+    try {
+      var storageKey = 'theme';
+      var stored = localStorage.getItem(storageKey);
+      var isValid = stored === 'light' || stored === 'dark';
+      var theme = isValid ? stored : 'light';
+
+      // Persist a sane default so a refresh doesn't fall back to light/system
+      if (!isValid) {
+        localStorage.setItem(storageKey, theme);
+      }
+
+      document.documentElement.classList.remove('light', 'dark');
+      document.documentElement.classList.add(theme);
+      document.documentElement.style.colorScheme = theme;
+    } catch (e) {
+      document.documentElement.classList.add('light');
+      document.documentElement.style.colorScheme = 'dark';
+    }
+  })();
+`;
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script
+          dangerouslySetInnerHTML={{ __html: themeScript }}
+          suppressHydrationWarning
+        />
+      </head>
+      <body
+        className={`${GeistSans.variable} ${GeistMono.variable} antialiased`}
+      >
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="light"
+          enableSystem={false}
+          disableTransitionOnChange
+          storageKey="theme"
+        >
+          {children}
+          <Toaster richColors />
+          <ServiceWorkerRegistration />
+        </ThemeProvider>
+      </body>
+    </html>
+  );
+}

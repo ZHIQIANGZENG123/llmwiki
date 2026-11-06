@@ -1,0 +1,10 @@
+﻿# Normalise every text file to LF in the repository so Linux checkouts behave.
+* text=auto eol=lf
+*.sh text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.gz binary
+*.woff binary
+*.woff2 binary

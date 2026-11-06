@@ -1,0 +1,1197 @@
+'use client'
+
+import * as React from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
+import {
+  Folder, FileText, NotepadText, Loader2, Trash2,
+  Upload, Plus, FolderPlus, ExternalLink, Pencil,
+  ChevronLeft, ChevronRight, ArrowUp, ArrowDown, MoreHorizontal,
+  Image, Sheet, Presentation, FileCode, Search, X, Download,
+} from 'lucide-react'
+import {
+  ContextMenu, ContextMenuTrigger, ContextMenuContent,
+  ContextMenuItem, ContextMenuSeparator,
+} from '@/components/ui/context-menu'
+import {
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
+  DropdownMenuItem, DropdownMenuSeparator, DropdownMenuSub,
+  DropdownMenuSubTrigger, DropdownMenuSubContent,
+} from '@/components/ui/dropdown-menu'
+import { toast } from 'sonner'
+import { cn } from '@/lib/utils'
+import { apiFetch } from '@/lib/api'
+import { apiUrl } from '@/lib/apiUrl'
+import { highlightTerms } from '@/lib/highlight'
+import { useUserStore } from '@/stores'
+import { NoteEditor } from '@/components/editor/NoteEditor'
+import { NoteFormattingButtons } from '@/components/editor/NoteToolbar'
+import type { Editor } from '@tiptap/react'
+import {
+  PdfDocViewer, ImageViewer, HtmlDocViewer, ContentViewer,
+  UnsupportedViewer, ProcessingViewer, FailedViewer,
+} from '@/components/kb/DocViewers'
+import type { DocumentListItem } from '@/lib/types'
+import type { SelectionGesture } from '@/components/kb/kb-detail/useBulkSelection'
+
+type SortField = 'name' | 'date' | 'type'
+type SortDir = 'asc' | 'desc'
+
+interface FolderNode {
+  name: string
+  path: string
+}
+
+interface ContentHit {
+  document_id: string
+  document_number: number
+  filename: string
+  title: string
+  path: string
+  relative_path: string
+  file_type: string
+  page: number | null
+  snippet: string
+  match_count: number
+  score: number
+}
+
+type SearchScope = 'all' | 'current' | 'wiki' | 'sources'
+
+const SEARCH_SCOPES: { value: SearchScope; label: string }[] = [
+  { value: 'all', label: 'All files' },
+  { value: 'current', label: 'This folder' },
+  { value: 'wiki', label: 'Wiki pages' },
+  { value: 'sources', label: 'Sources' },
+]
+
+const SEARCH_HISTORY_KEY = 'kb-content-search-history'
+
+function getChildFolders(docs: DocumentListItem[], currentPath: string): FolderNode[] {
+  const folders = new Map<string, FolderNode>()
+  for (const doc of docs) {
+    const docPath = doc.path || '/'
+    if (!docPath.startsWith(currentPath) || docPath === currentPath) continue
+    const rest = docPath.slice(currentPath.length)
+    const nextSlash = rest.indexOf('/')
+    if (nextSlash <= 0) continue
+    const segment = rest.slice(0, nextSlash)
+    const folderPath = currentPath + segment + '/'
+    if (!folders.has(folderPath)) {
+      folders.set(folderPath, { name: segment, path: folderPath })
+    }
+  }
+  return Array.from(folders.values()).sort((a, b) => a.name.localeCompare(b.name))
+}
+
+function getDocsInFolder(docs: DocumentListItem[], currentPath: string): DocumentListItem[] {
+  return docs.filter((d) => (d.path || '/') === currentPath)
+}
+
+function sortDocs(docs: DocumentListItem[], field: SortField, dir: SortDir): DocumentListItem[] {
+  const sorted = [...docs]
+  sorted.sort((a, b) => {
+    let cmp = 0
+    switch (field) {
+      case 'name': cmp = (a.title || a.filename).localeCompare(b.title || b.filename); break
+      case 'date': cmp = new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime(); break
+      case 'type': cmp = a.file_type.localeCompare(b.file_type); break
+    }
+    return dir === 'asc' ? cmp : -cmp
+  })
+  return sorted
+}
+
+function parseBreadcrumbs(path: string): { label: string; path: string }[] {
+  const segments: { label: string; path: string }[] = [{ label: 'Files', path: '/' }]
+  if (path === '/') return segments
+  const parts = path.replace(/^\//, '').replace(/\/$/, '').split('/')
+  let accumulated = '/'
+  for (const part of parts) {
+    accumulated += part + '/'
+    segments.push({ label: part, path: accumulated })
+  }
+  return segments
+}
+
+function isNoteFile(doc: DocumentListItem): boolean {
+  const ft = doc.file_type
+  return ft === 'md' || ft === 'txt' || ft === 'note'
+}
+
+function isWebClipDoc(doc: DocumentListItem): boolean {
+  const metadata = doc.metadata ?? {}
+  return (
+    metadata.clip_kind === 'web'
+    || metadata.source_url !== undefined
+    || ((doc.path || '').startsWith('/webclipper/') && doc.file_type === 'md')
+    || ['html', 'htm'].includes(doc.file_type)
+  )
+}
+
+function getSourceUrl(doc: DocumentListItem | null): string | null {
+  const value = doc?.metadata?.source_url
+  if (typeof value !== 'string') return null
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : null
+  } catch {
+    return null
+  }
+}
+
+function docIcon(ft: string) {
+  if (ft === 'pdf') return <FileText className="size-8 text-red-400/70" />
+  if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ft)) return <Image className="size-8 text-violet-400/70" />
+  if (['xlsx', 'xls', 'csv'].includes(ft)) return <Sheet className="size-8 text-emerald-500/70" />
+  if (['pptx', 'ppt', 'docx', 'doc'].includes(ft)) return <Presentation className="size-8 text-orange-400/70" />
+  if (['html', 'htm'].includes(ft)) return <FileCode className="size-8 text-sky-400/70" />
+  if (['md', 'txt'].includes(ft)) return <NotepadText className="size-8 text-muted-foreground/50" />
+  return <FileText className="size-8 text-muted-foreground/40" />
+}
+
+interface FilesGridProps {
+  documents: DocumentListItem[]
+  onDeleteDocument: (id: string) => void
+  onRenameDocument: (id: string, newTitle: string) => void
+  onUpload: (path: string) => void
+  onCreateNote: (path: string) => void
+  onCreateFolder: (name: string, parentPath: string) => void
+  onMoveDocument?: (docId: string, targetPath: string) => void
+  onUploadFiles?: (files: File[], targetPath: string) => void
+  initialDocId?: string | null
+  initialPage?: number
+  initialPath?: string
+  onPathChange?: (path: string) => void
+  onDocOpen?: (docNumber: number | null) => void
+  onDocClose?: () => void
+  selectedIds: ReadonlySet<string>
+  onSelectDocument: (docId: string, gesture: SelectionGesture, visibleIds: readonly string[]) => void
+  onShownFolderChange: () => void
+  /** Delete a folder and everything under it; omitted for read-only sessions. */
+  onDeleteFolder?: (path: string) => void
+  /** Bump to re-read the folder listing after a folder is created. */
+  foldersVersion?: number
+  /** Readers may browse and download but must not see write affordances. */
+  readOnly?: boolean
+}
+
+export function FilesGrid({
+  documents,
+  onDeleteDocument,
+  onRenameDocument,
+  onUpload,
+  onCreateNote,
+  onCreateFolder,
+  onMoveDocument,
+  onUploadFiles,
+  initialDocId,
+  initialPage,
+  initialPath,
+  onPathChange,
+  onDocOpen,
+  onDocClose,
+  selectedIds,
+  onSelectDocument,
+  onShownFolderChange,
+  onDeleteFolder,
+  foldersVersion = 0,
+  readOnly = false,
+}: FilesGridProps) {
+  const [currentPath, setCurrentPath] = React.useState(initialPath ?? '/')
+  React.useEffect(() => onShownFolderChange(), [currentPath, onShownFolderChange])
+  const [history, setHistory] = React.useState<string[]>([initialPath ?? '/'])
+  const [historyIdx, setHistoryIdx] = React.useState(0)
+
+  const [activeDocId, setActiveDocId] = React.useState<string | null>(initialDocId ?? null)
+  const [docInitialPage, setDocInitialPage] = React.useState<number | undefined>(initialPage)
+
+  // The state above only seeds from the prop. Opening a document from the sidebar search
+  // (or any link outside the grid) changes `initialDocId` on an already-mounted grid, so
+  // follow it — otherwise the click did nothing at all.
+  React.useEffect(() => {
+    if (initialDocId) setActiveDocId(initialDocId)
+  }, [initialDocId])
+
+  React.useEffect(() => {
+    const path = initialPath ?? '/'
+    if (path === currentPath) return
+    setCurrentPath(path)
+    if (history[historyIdx - 1] === path) {
+      setHistoryIdx(historyIdx - 1)
+    } else if (history[historyIdx + 1] === path) {
+      setHistoryIdx(historyIdx + 1)
+    } else {
+      setHistory(history.slice(0, historyIdx + 1).concat(path))
+      setHistoryIdx(historyIdx + 1)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialPath])
+
+  const [sortField, setSortField] = React.useState<SortField>('name')
+  const [sortDir, setSortDir] = React.useState<SortDir>('asc')
+  const [searchQuery, setSearchQuery] = React.useState('')
+  const [searchOpen, setSearchOpen] = React.useState(false)
+  const searchInputRef = React.useRef<HTMLInputElement>(null)
+  const [folderDialogOpen, setFolderDialogOpen] = React.useState(false)
+  const [folderName, setFolderName] = React.useState('')
+
+  // Folders that exist on disk but hold no indexed document (fresh or fully ignored ones).
+  const [diskFolders, setDiskFolders] = React.useState<FolderNode[]>([])
+  // Full-text hits from the API; the name filter above only ever matched titles.
+  const [contentHits, setContentHits] = React.useState<ContentHit[]>([])
+  const [searchingContent, setSearchingContent] = React.useState(false)
+  const [searchScope, setSearchScope] = React.useState<SearchScope>('all')
+  const [searchTotal, setSearchTotal] = React.useState(0)
+  const [searchHasMore, setSearchHasMore] = React.useState(false)
+  const [searchHistory, setSearchHistory] = React.useState<string[]>([])
+
+  const [noteEditor, setNoteEditor] = React.useState<Editor | null>(null)
+  const [noteTitle, setNoteTitle] = React.useState('')
+  const noteTitleChangeRef = React.useRef<((title: string) => void) | null>(null)
+  React.useEffect(() => { setNoteEditor(null); setNoteTitle('') }, [activeDocId])
+
+  const sourceDocs = React.useMemo(
+    () => documents.filter((d) => (
+      !d.path.startsWith('/wiki/') &&
+      !d.archived &&
+      d.metadata?.hidden !== true &&
+      d.metadata?.asset !== true
+    )),
+    [documents],
+  )
+
+  // Fall back to the full list: a content-search hit can be a wiki page, which `sourceDocs`
+  // deliberately excludes, and resolving it only there made the click a silent no-op.
+  const activeDoc = React.useMemo(
+    () => activeDocId
+      ? sourceDocs.find((d) => d.id === activeDocId) ?? documents.find((d) => d.id === activeDocId) ?? null
+      : null,
+    [activeDocId, sourceDocs, documents],
+  )
+
+  const isBrowsing = !activeDoc
+
+  React.useEffect(() => { if (activeDoc) setNoteTitle(activeDoc.title || activeDoc.filename) }, [activeDoc])
+
+  const navigateTo = React.useCallback((path: string) => {
+    setActiveDocId(null)
+    setDocInitialPage(undefined)
+    setCurrentPath(path)
+    onPathChange?.(path)
+    setHistory((prev) => {
+      const next = prev.slice(0, historyIdx + 1)
+      next.push(path)
+      return next
+    })
+    setHistoryIdx((prev) => prev + 1)
+  }, [historyIdx, onPathChange])
+
+  const openDoc = React.useCallback((doc: DocumentListItem) => {
+    setActiveDocId(doc.id)
+    setDocInitialPage(undefined)
+    onDocOpen?.(doc.document_number)
+  }, [onDocOpen])
+
+  // Download by document id, not by file path: the Next proxy returns 404 when a
+  // percent-encoded (non-ASCII) path is combined with a query string, and a plain file
+  // URL makes the browser render a PDF instead of saving it.
+  const downloadDoc = React.useCallback((docId: string, filename?: string) => {
+    const query = filename ? `?name=${encodeURIComponent(filename)}` : ''
+    window.open(apiUrl(`/v1/documents/${docId}/download${query}`), '_blank', 'noopener,noreferrer')
+  }, [])
+
+  // Zip a folder or the current selection and let the browser save it.
+  const downloadArchive = React.useCallback((target: { ids?: string; path?: string }) => {
+    const query = new URLSearchParams()
+    if (target.ids) query.set('ids', target.ids)
+    else query.set('path', target.path ?? currentPath)
+    window.open(apiUrl(`/v1/archive?${query.toString()}`), '_blank', 'noopener,noreferrer')
+  }, [currentPath])
+
+  const closeDoc = React.useCallback(() => {
+    setActiveDocId(null)
+    setDocInitialPage(undefined)
+    onDocClose?.()
+  }, [onDocClose])
+
+  const canGoBack = isBrowsing ? historyIdx > 0 : true
+  const canGoForward = isBrowsing ? historyIdx < history.length - 1 : false
+
+  const goBack = React.useCallback(() => {
+    if (!isBrowsing) {
+      closeDoc()
+      return
+    }
+    if (historyIdx <= 0) return
+    // Walk the component's own history. `navigateTo` never calls pushState, so
+    // `window.history.back()` would leave the page instead of the folder.
+    const previous = history[historyIdx - 1]
+    setHistoryIdx(historyIdx - 1)
+    setCurrentPath(previous)
+    onPathChange?.(previous)
+  }, [isBrowsing, closeDoc, history, historyIdx, onPathChange])
+
+  const goForward = React.useCallback(() => {
+    if (!isBrowsing || !canGoForward) return
+    const next = history[historyIdx + 1]
+    setHistoryIdx(historyIdx + 1)
+    setCurrentPath(next)
+    onPathChange?.(next)
+  }, [isBrowsing, canGoForward, history, historyIdx, onPathChange])
+
+  React.useEffect(() => {
+    let cancelled = false
+    const token = useUserStore.getState().accessToken ?? ''
+    apiFetch<{ folders: FolderNode[] }>(`/v1/folders?path=${encodeURIComponent(currentPath)}`, token)
+      .then((res) => { if (!cancelled) setDiskFolders(res.folders ?? []) })
+      .catch(() => { if (!cancelled) setDiskFolders([]) })
+    return () => { cancelled = true }
+  }, [currentPath, foldersVersion])
+
+  const folders = React.useMemo(() => {
+    const merged = new Map<string, FolderNode>()
+    for (const folder of getChildFolders(sourceDocs, currentPath)) merged.set(folder.path, folder)
+    for (const folder of diskFolders) {
+      if (!merged.has(folder.path)) merged.set(folder.path, folder)
+    }
+    return Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name))
+  }, [sourceDocs, currentPath, diskFolders])
+  const docsInFolder = React.useMemo(() => sortDocs(getDocsInFolder(sourceDocs, currentPath), sortField, sortDir), [sourceDocs, currentPath, sortField, sortDir])
+
+  const filteredFolders = React.useMemo(() => {
+    if (!searchQuery) return folders
+    const q = searchQuery.toLowerCase()
+    return folders.filter((f) => f.name.toLowerCase().includes(q))
+  }, [folders, searchQuery])
+
+  const filteredDocs = React.useMemo(() => {
+    if (!searchQuery) return docsInFolder
+    const q = searchQuery.toLowerCase()
+    return docsInFolder.filter((d) => (d.title || d.filename).toLowerCase().includes(q) || d.file_type.toLowerCase().includes(q))
+  }, [docsInFolder, searchQuery])
+
+  const visibleDocIds = React.useMemo(() => filteredDocs.map((d) => d.id), [filteredDocs])
+
+  // Search inside documents. One character is too noisy to be useful, so wait for two.
+  const runContentSearch = React.useCallback(
+    (query: string, scope: SearchScope, offset: number) => {
+      const token = useUserStore.getState().accessToken ?? ''
+      const params = new URLSearchParams({ q: query, limit: '20', offset: String(offset) })
+      params.set('scope', scope === 'current' ? currentPath : scope)
+      return apiFetch<{ results: ContentHit[]; total: number; has_more: boolean }>(
+        `/v1/search?${params.toString()}`,
+        token,
+      )
+    },
+    [currentPath],
+  )
+
+  React.useEffect(() => {
+    const query = searchQuery.trim()
+    if (query.length < 2) {
+      setContentHits([])
+      setSearchTotal(0)
+      setSearchHasMore(false)
+      setSearchingContent(false)
+      return
+    }
+    let cancelled = false
+    setSearchingContent(true)
+    const timer = setTimeout(() => {
+      runContentSearch(query, searchScope, 0)
+        .then((res) => {
+          if (cancelled) return
+          setContentHits(res.results ?? [])
+          setSearchTotal(res.total ?? 0)
+          setSearchHasMore(!!res.has_more)
+        })
+        .catch(() => {
+          if (cancelled) return
+          setContentHits([])
+          setSearchTotal(0)
+          setSearchHasMore(false)
+        })
+        .finally(() => { if (!cancelled) setSearchingContent(false) })
+    }, 250)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [searchQuery, searchScope, runContentSearch])
+
+  const loadMoreContent = React.useCallback(() => {
+    const query = searchQuery.trim()
+    if (query.length < 2 || searchingContent) return
+    setSearchingContent(true)
+    runContentSearch(query, searchScope, contentHits.length)
+      .then((res) => {
+        setContentHits((prev) => [...prev, ...(res.results ?? [])])
+        setSearchTotal(res.total ?? 0)
+        setSearchHasMore(!!res.has_more)
+      })
+      .catch(() => undefined)
+      .finally(() => setSearchingContent(false))
+  }, [searchQuery, searchScope, contentHits.length, searchingContent, runContentSearch])
+
+  React.useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SEARCH_HISTORY_KEY)
+      if (raw) setSearchHistory(JSON.parse(raw) as string[])
+    } catch {
+      // A corrupt entry just means no history; never block the grid on it.
+    }
+  }, [])
+
+  const rememberSearch = React.useCallback((term: string) => {
+    const value = term.trim()
+    if (value.length < 2) return
+    setSearchHistory((prev) => {
+      const next = [value, ...prev.filter((item) => item !== value)].slice(0, 8)
+      try {
+        localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next))
+      } catch {
+        // Storage can be full or blocked; history is a convenience, not state.
+      }
+      return next
+    })
+  }, [])
+
+  const searchTerms = React.useMemo(
+    () => searchQuery.trim().split(/\s+/).filter(Boolean),
+    [searchQuery],
+  )
+
+  const isActiveWebClip = activeDoc ? isWebClipDoc(activeDoc) : false
+  const isActiveNote = activeDoc ? isNoteFile(activeDoc) && !isActiveWebClip : false
+  const activeSourceUrl = getSourceUrl(activeDoc)
+
+  const breadcrumbs = React.useMemo(() => {
+    const crumbs = parseBreadcrumbs(activeDoc ? (activeDoc.path || '/') : currentPath)
+    if (activeDoc) {
+      crumbs.push({
+        label: activeDoc.title || activeDoc.filename,
+        path: isActiveNote ? '__note__' : '__doc__',
+      })
+    }
+    return crumbs
+  }, [currentPath, activeDoc, isActiveNote])
+
+  const handleUploadHere = React.useCallback(() => onUpload(currentPath), [onUpload, currentPath])
+  const handleCreateNoteHere = React.useCallback(() => onCreateNote(currentPath), [onCreateNote, currentPath])
+
+  const handleCreateFolder = () => {
+    if (!folderName.trim()) return
+    onCreateFolder(folderName.trim(), currentPath)
+    setFolderName('')
+    setFolderDialogOpen(false)
+  }
+
+  React.useEffect(() => {
+    if (searchOpen) {
+      const t = setTimeout(() => searchInputRef.current?.focus(), 50)
+      return () => clearTimeout(t)
+    }
+  }, [searchOpen])
+
+  const [gridDragOver, setGridDragOver] = React.useState(false)
+  const gridDragCounter = React.useRef(0)
+
+  const handleGridDragEnter = (e: React.DragEvent) => {
+    if (e.dataTransfer.types.includes('application/x-llmwiki-item')) return
+    e.preventDefault()
+    gridDragCounter.current++
+    if (gridDragCounter.current === 1) setGridDragOver(true)
+  }
+  const handleGridDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    gridDragCounter.current--
+    if (gridDragCounter.current === 0) setGridDragOver(false)
+  }
+  const handleGridDragOver = (e: React.DragEvent) => {
+    if (e.dataTransfer.types.includes('application/x-llmwiki-item')) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
+  }
+  const handleGridDrop = (e: React.DragEvent) => {
+    if (e.dataTransfer.types.includes('application/x-llmwiki-item')) return
+    e.preventDefault()
+    gridDragCounter.current = 0
+    setGridDragOver(false)
+    const files = Array.from(e.dataTransfer.files)
+    if (files.length > 0) onUploadFiles?.(files, currentPath)
+  }
+
+  const handleFolderDrop = React.useCallback((docIds: string[], targetPath: string) => {
+    for (const id of docIds) onMoveDocument?.(id, targetPath)
+  }, [onMoveDocument])
+
+  const handleFolderFileDrop = React.useCallback((files: File[], targetPath: string) => {
+    onUploadFiles?.(files, targetPath)
+  }, [onUploadFiles])
+
+  const sortLabels: Record<SortField, string> = { name: 'Name', date: 'Modified', type: 'Kind' }
+  const isEmpty = filteredFolders.length === 0 && filteredDocs.length === 0
+
+  return (
+    <div
+      className="h-full flex flex-col overflow-hidden relative"
+      onDragEnter={handleGridDragEnter}
+      onDragLeave={handleGridDragLeave}
+      onDragOver={handleGridDragOver}
+      onDrop={handleGridDrop}
+    >
+      {gridDragOver && (
+        <div className="absolute inset-0 z-40 bg-background/80 backdrop-blur-sm flex items-center justify-center pointer-events-none">
+          <div className="flex flex-col items-center gap-3 border-2 border-dashed border-primary rounded-xl px-12 py-10">
+            <Upload className="size-8 text-primary" />
+            <p className="text-sm font-medium text-primary">Drop files to upload</p>
+            <p className="text-xs text-muted-foreground">to {currentPath === '/' ? 'Files' : currentPath.replace(/\/$/, '').split('/').pop()}</p>
+          </div>
+        </div>
+      )}
+
+      <div className="shrink-0 flex items-center gap-1.5 px-4 h-10 border-b border-border">
+        <button
+          onClick={goBack}
+          disabled={!canGoBack}
+          className={cn(
+            'p-1 rounded-md transition-colors cursor-pointer',
+            canGoBack ? 'text-muted-foreground hover:text-foreground hover:bg-accent' : 'text-muted-foreground/30 cursor-default'
+          )}
+        >
+          <ChevronLeft className="size-4" />
+        </button>
+        <button
+          onClick={goForward}
+          disabled={!isBrowsing || !canGoForward}
+          className={cn(
+            'p-1 rounded-md transition-colors cursor-pointer',
+            isBrowsing && canGoForward ? 'text-muted-foreground hover:text-foreground hover:bg-accent' : 'text-muted-foreground/30 cursor-default'
+          )}
+        >
+          <ChevronRight className="size-4" />
+        </button>
+
+        <nav className="flex items-center gap-1 text-sm min-w-0 mr-auto overflow-hidden ml-1">
+          {breadcrumbs.map((seg, i) => {
+            const isLast = i === breadcrumbs.length - 1
+            const isDocLeaf = seg.path === '__doc__'
+            const isNoteLeaf = seg.path === '__note__'
+            return (
+              <React.Fragment key={`${seg.path}-${i}`}>
+                {i > 0 && <span className="text-muted-foreground/50 flex-shrink-0">/</span>}
+                {isNoteLeaf ? (
+                  <input
+                    type="text"
+                    value={noteTitle}
+                    onChange={(e) => {
+                      setNoteTitle(e.target.value)
+                      noteTitleChangeRef.current?.(e.target.value)
+                    }}
+                    placeholder="Untitled"
+                    className="min-w-[80px] flex-1 text-sm font-medium text-foreground bg-transparent border-none outline-none placeholder:text-muted-foreground/30 truncate"
+                  />
+                ) : isDocLeaf ? (
+                  <span className="font-medium text-foreground truncate">
+                    {seg.label}
+                  </span>
+                ) : isLast ? (
+                  <span className="font-medium text-foreground truncate">{seg.label}</span>
+                ) : (
+                  <BreadcrumbDropTarget
+                    label={seg.label}
+                    path={seg.path}
+                    onNavigate={() => navigateTo(seg.path)}
+                    onDropDocuments={handleFolderDrop}
+                    onDropFiles={handleFolderFileDrop}
+                  />
+                )}
+              </React.Fragment>
+            )
+          })}
+        </nav>
+
+        {isBrowsing ? (
+          <>
+            <div className={cn(
+              'relative flex items-center rounded-md transition-all duration-200 ease-in-out overflow-hidden',
+              searchOpen ? 'w-48 bg-muted/50 border border-border' : 'w-7'
+            )}>
+              <button
+                onClick={() => !searchOpen && setSearchOpen(true)}
+                className={cn(
+                  'flex-shrink-0 p-1.5 text-muted-foreground transition-colors cursor-pointer',
+                  !searchOpen && 'hover:text-foreground hover:bg-accent rounded-md'
+                )}
+              >
+                <Search className="size-3.5" />
+              </button>
+              {searchOpen && (
+                <>
+                  <input
+                    ref={searchInputRef}
+                    type="text"
+                    placeholder="Search contents..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') rememberSearch(searchQuery)
+                      if (e.key === 'Escape') { setSearchQuery(''); setSearchOpen(false) }
+                    }}
+                    onBlur={() => { if (!searchQuery) setSearchOpen(false) }}
+                    className="flex-1 min-w-0 pr-6 py-1 text-sm bg-transparent placeholder:text-muted-foreground/60 focus:outline-none"
+                  />
+                  <button
+                    onClick={() => { setSearchQuery(''); setSearchOpen(false) }}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
+                  >
+                    <X className="size-3" />
+                  </button>
+                </>
+              )}
+            </div>
+
+            {!readOnly && (
+              <button onClick={handleUploadHere} className="flex items-center gap-1.5 p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer">
+                <Upload className="size-3.5" />
+                <span className="text-xs">Upload</span>
+              </button>
+            )}
+
+            <button
+              onClick={() => setSortDir((d) => d === 'asc' ? 'desc' : 'asc')}
+              className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
+              title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
+            >
+              {sortDir === 'asc' ? <ArrowUp className="size-3.5" /> : <ArrowDown className="size-3.5" />}
+            </button>
+
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer">
+                  <MoreHorizontal className="size-3.5" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => setFolderDialogOpen(true)}>
+                  <FolderPlus className="size-3.5 mr-2" />
+                  New Folder
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleCreateNoteHere}>
+                  <NotepadText className="size-3.5 mr-2" />
+                  New Note
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger>
+                    {sortDir === 'asc' ? <ArrowUp className="size-3.5 mr-2" /> : <ArrowDown className="size-3.5 mr-2" />}
+                    Sort by {sortLabels[sortField]}
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent>
+                    {(Object.keys(sortLabels) as SortField[]).map((field) => (
+                      <DropdownMenuItem key={field} onClick={() => setSortField(field)}>
+                        {sortLabels[field]}
+                        {sortField === field && (
+                          <span className="ml-auto text-xs text-muted-foreground">
+                            {sortDir === 'asc' ? '\u2191' : '\u2193'}
+                          </span>
+                        )}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </>
+        ) : activeDoc && isActiveNote ? (
+          <>
+            <NoteFormattingButtons editor={noteEditor} />
+            {activeSourceUrl && (
+              <button
+                onClick={() => window.open(activeSourceUrl, '_blank', 'noopener,noreferrer')}
+                className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
+                title="Open source URL"
+              >
+                <ExternalLink className="size-3.5" />
+              </button>
+            )}
+            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
+              <X className="size-3.5" />
+            </button>
+          </>
+        ) : activeDoc && isActiveWebClip ? (
+          <>
+            {activeSourceUrl && (
+              <button
+                onClick={() => window.open(activeSourceUrl, '_blank', 'noopener,noreferrer')}
+                className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
+                title="Open source URL"
+              >
+                <ExternalLink className="size-3.5" />
+              </button>
+            )}
+            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
+              <X className="size-3.5" />
+            </button>
+          </>
+        ) : activeDoc ? (
+          <>
+            <button onClick={() => downloadDoc(activeDoc.id)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Download" aria-label="Download">
+              <Download className="size-3.5" />
+            </button>
+            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
+              <X className="size-3.5" />
+            </button>
+          </>
+        ) : null}
+      </div>
+
+      <div className="flex-1 min-h-0">
+        {activeDoc ? (
+          isWebClipDoc(activeDoc) ? (
+            <HtmlDocViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} />
+          ) : isNoteFile(activeDoc) ? (
+            <NoteEditor
+              key={activeDoc.id}
+              documentId={activeDoc.id}
+              initialTitle={activeDoc.title ?? activeDoc.filename}
+              initialTags={activeDoc.tags}
+              initialDate={activeDoc.date}
+              initialProperties={activeDoc.metadata?.properties as Record<string, unknown> | undefined}
+              embedded
+              hideToolbar
+              onEditorReady={setNoteEditor}
+              titleChangeRef={noteTitleChangeRef}
+            />
+          ) : activeDoc.status === 'pending' || activeDoc.status === 'processing' ? (
+            <ProcessingViewer title={activeDoc.title || activeDoc.filename} />
+          ) : activeDoc.status === 'failed' ? (
+            <FailedViewer title={activeDoc.title || activeDoc.filename} errorMessage={activeDoc.error_message} />
+          ) : ['pdf', 'pptx', 'ppt', 'docx', 'doc'].includes(activeDoc.file_type) ? (
+            <PdfDocViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} initialPage={docInitialPage} hideToolbar />
+          ) : ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'].includes(activeDoc.file_type) ? (
+            <ImageViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} />
+          ) : ['xlsx', 'xls', 'csv'].includes(activeDoc.file_type) ? (
+            <ContentViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} fileType={activeDoc.file_type} />
+          ) : (
+            <UnsupportedViewer title={activeDoc.title || activeDoc.filename} />
+          )
+        ) : (
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <div className="h-full overflow-y-auto p-4">
+                {searchOpen && searchQuery.trim().length < 2 && searchHistory.length > 0 && (
+                  <div className="mb-4 flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] text-muted-foreground/70">Recent:</span>
+                    {searchHistory.map((item) => (
+                      <button
+                        key={item}
+                        type="button"
+                        onClick={() => setSearchQuery(item)}
+                        className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent cursor-pointer"
+                      >
+                        {item}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {searchQuery.trim().length >= 2 && (
+                  <div className="mb-4 rounded-lg border border-border/60 bg-muted/20">
+                    <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-3 py-2">
+                      <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">
+                        {searchingContent ? <Loader2 className="size-3 animate-spin" /> : <Search className="size-3" />}
+                        In document contents
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {searchTotal} {searchTotal === 1 ? 'document' : 'documents'}
+                      </span>
+                      <div className="ml-auto flex flex-wrap items-center gap-1">
+                        {SEARCH_SCOPES.map((option) => (
+                          <button
+                            key={option.value}
+                            type="button"
+                            onClick={() => setSearchScope(option.value)}
+                            className={cn(
+                              'rounded-full px-2 py-0.5 text-[11px] transition-colors cursor-pointer',
+                              searchScope === option.value
+                                ? 'bg-foreground text-background'
+                                : 'bg-muted text-muted-foreground hover:bg-accent',
+                            )}
+                          >
+                            {option.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <ul className="divide-y divide-border/50">
+                      {contentHits.map((hit) => (
+                        <li key={hit.document_id}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const doc = documents.find((d) => d.id === hit.document_id)
+                              if (doc) openDoc(doc)
+                            }}
+                            className="flex w-full flex-col gap-0.5 px-3 py-2 text-left transition-colors hover:bg-accent"
+                          >
+                            <span className="flex w-full items-center gap-2">
+                              <span className="truncate text-xs font-medium text-foreground">
+                                {highlightTerms(hit.title, searchTerms)}
+                              </span>
+                              {hit.page ? (
+                                <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground">
+                                  p.{hit.page}
+                                </span>
+                              ) : null}
+                              <span className="ml-auto shrink-0 text-[10px] text-muted-foreground/70">
+                                {hit.match_count} hits
+                              </span>
+                            </span>
+                            <span className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+                              {highlightTerms(hit.snippet, searchTerms)}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                      {!searchingContent && contentHits.length === 0 && (
+                        <li className="px-3 py-2 text-xs text-muted-foreground">No content matches in this scope.</li>
+                      )}
+                    </ul>
+                    {searchHasMore && (
+                      <div className="border-t border-border/60 px-3 py-2">
+                        <button
+                          type="button"
+                          onClick={loadMoreContent}
+                          disabled={searchingContent}
+                          className="text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50 cursor-pointer"
+                        >
+                          Load more ({contentHits.length} / {searchTotal})
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {isEmpty && !searchQuery.trim() ? (
+                  <EmptyState
+                    isRoot={currentPath === '/'}
+                    folderName={parseBreadcrumbs(currentPath).slice(-1)[0]?.label}
+                    onUpload={readOnly ? undefined : handleUploadHere}
+                    onCreateNote={readOnly ? undefined : handleCreateNoteHere}
+                  />
+                ) : (
+                  <div className="min-h-full">
+                    <div className="grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-3">
+                      <AnimatePresence initial={false} mode="popLayout">
+                        {!readOnly && (
+                          <motion.div key="add-new" layout transition={{ layout: { duration: 0.15, ease: 'easeOut' } }} className="h-full">
+                            <NewCard onCreateNote={handleCreateNoteHere} onUpload={handleUploadHere} onCreateFolder={() => setFolderDialogOpen(true)} />
+                          </motion.div>
+                        )}
+                        {filteredFolders.map((folder) => (
+                          <motion.div key={`folder-${folder.path}`} layout exit={{ opacity: 0, scale: 0.95 }} transition={{ layout: { duration: 0.15, ease: 'easeOut' }, opacity: { duration: 0.1 } }} className="h-full">
+                            <FolderCard
+                              name={folder.name}
+                              path={folder.path}
+                              onNavigate={() => navigateTo(folder.path)}
+                              onDropDocuments={handleFolderDrop}
+                              onDropFiles={handleFolderFileDrop}
+                              onDownload={() => downloadArchive({ path: folder.path })}
+                              onDelete={onDeleteFolder ? () => onDeleteFolder(folder.path) : undefined}
+                            />
+                          </motion.div>
+                        ))}
+                        {filteredDocs.map((doc) => (
+                          <motion.div key={doc.id} layout exit={{ opacity: 0, scale: 0.95 }} transition={{ layout: { duration: 0.15, ease: 'easeOut' }, opacity: { duration: 0.1 } }} className="h-full">
+                            <DocumentCard
+                              doc={doc}
+                              isSelected={selectedIds.has(doc.id)}
+                              onOpen={() => openDoc(doc)}
+                              onSelect={(gesture) => onSelectDocument(doc.id, gesture, visibleDocIds)}
+                              onDelete={() => onDeleteDocument(doc.id)}
+                              onRename={(t) => onRenameDocument(doc.id, t)}
+                              onDownload={() => downloadDoc(doc.id, doc.filename)}
+                            />
+                          </motion.div>
+                        ))}
+                      </AnimatePresence>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </ContextMenuTrigger>
+            <ContextMenuContent>
+              {!readOnly && (
+                <>
+              <ContextMenuItem onClick={handleCreateNoteHere}><NotepadText className="size-3.5 mr-2" />New note</ContextMenuItem>
+              <ContextMenuItem onClick={() => setFolderDialogOpen(true)}><FolderPlus className="size-3.5 mr-2" />New folder</ContextMenuItem>
+                </>
+              )}
+              <ContextMenuSeparator />
+              {!readOnly && (
+                <ContextMenuItem onClick={handleUploadHere}><Upload className="size-3.5 mr-2" />Upload files</ContextMenuItem>
+              )}
+            </ContextMenuContent>
+          </ContextMenu>
+        )}
+      </div>
+
+      {folderDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setFolderDialogOpen(false)}>
+          <div className="bg-background border border-border rounded-lg p-6 w-80 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-sm font-medium mb-3">New folder</h3>
+            <input value={folderName} onChange={(e) => setFolderName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleCreateFolder()} placeholder="Folder name" className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm mb-3" autoFocus />
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setFolderDialogOpen(false)} className="rounded-lg px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer">Cancel</button>
+              <button onClick={handleCreateFolder} disabled={!folderName.trim()} className="rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50 cursor-pointer">Create</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function FolderCard({ name, path, onNavigate, onDropDocuments, onDropFiles, onDownload, onDelete }: {
+  name: string
+  path: string
+  onNavigate: () => void
+  onDropDocuments: (docIds: string[], targetPath: string) => void
+  onDropFiles: (files: File[], targetPath: string) => void
+  onDownload?: () => void
+  onDelete?: () => void
+}) {
+  const [dragOver, setDragOver] = React.useState(false)
+  const dragCounter = React.useRef(0)
+
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+    <div
+      onClick={onNavigate}
+      onDragEnter={(e) => { e.preventDefault(); e.stopPropagation(); dragCounter.current++; if (dragCounter.current === 1) setDragOver(true) }}
+      onDragLeave={(e) => { e.preventDefault(); e.stopPropagation(); dragCounter.current--; if (dragCounter.current === 0) setDragOver(false) }}
+      onDragOver={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        e.dataTransfer.dropEffect = e.dataTransfer.types.includes('application/x-llmwiki-item') ? 'move' : 'copy'
+      }}
+      onDrop={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        dragCounter.current = 0
+        setDragOver(false)
+        if (e.dataTransfer.types.includes('application/x-llmwiki-item')) {
+          try {
+            const data = JSON.parse(e.dataTransfer.getData('application/x-llmwiki-item'))
+            onDropDocuments(data.ids, path)
+          } catch { /* ignore malformed data */ }
+        } else {
+          const files = Array.from(e.dataTransfer.files)
+          if (files.length > 0) onDropFiles(files, path)
+        }
+      }}
+      className={cn(
+        'group relative rounded-lg border cursor-pointer transition-colors flex flex-col overflow-hidden h-full',
+        dragOver
+          ? 'border-primary bg-primary/10 ring-2 ring-primary/30'
+          : 'border-border hover:bg-muted/50',
+      )}
+    >
+      <div className="flex items-center justify-center aspect-square">
+        <Folder className={cn('size-12', dragOver ? 'text-primary' : 'text-muted-foreground/70')} />
+      </div>
+      <div className="px-2 py-1.5">
+        <span className="text-xs font-medium text-foreground truncate block">{name}</span>
+      </div>
+    </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onClick={onNavigate}><ExternalLink className="size-3.5 mr-2" />Open</ContextMenuItem>
+        {onDownload && (
+          <ContextMenuItem onClick={onDownload}><Download className="size-3.5 mr-2" />Download folder (.zip)</ContextMenuItem>
+        )}
+        {onDelete && (
+          <>
+            <ContextMenuSeparator />
+            <ContextMenuItem variant="destructive" onClick={onDelete}><Trash2 className="size-3.5 mr-2" />Delete folder</ContextMenuItem>
+          </>
+        )}
+      </ContextMenuContent>
+    </ContextMenu>
+  )
+}
+
+function selectionGestureFor(e: React.MouseEvent): SelectionGesture | null {
+  if (e.metaKey || e.ctrlKey) return 'toggle'
+  if (e.shiftKey) return 'range'
+  return null
+}
+
+function DocumentCard({ doc, isSelected, onOpen, onSelect, onDelete, onRename, onDownload }: {
+  doc: DocumentListItem
+  isSelected: boolean
+  onOpen: () => void
+  onSelect: (gesture: SelectionGesture) => void
+  onDelete: () => void
+  onRename: (t: string) => void
+  onDownload: () => void
+}) {
+  const [renaming, setRenaming] = React.useState(false)
+  const [renameValue, setRenameValue] = React.useState('')
+  const [dragging, setDragging] = React.useState(false)
+  const inputRef = React.useRef<HTMLInputElement>(null)
+  const isProcessing = doc.status === 'processing' || doc.status === 'pending'
+
+  const startRename = () => {
+    setRenameValue(doc.title || doc.filename)
+    setRenaming(true)
+    requestAnimationFrame(() => { inputRef.current?.focus(); inputRef.current?.select() })
+  }
+
+  const commitRename = () => {
+    const trimmed = renameValue.trim()
+    if (trimmed && trimmed !== (doc.title || doc.filename)) onRename(trimmed)
+    setRenaming(false)
+  }
+
+  const handleDragStart = (e: React.DragEvent) => {
+    if (renaming) { e.preventDefault(); return }
+    e.dataTransfer.setData('application/x-llmwiki-item', JSON.stringify({ ids: [doc.id] }))
+    e.dataTransfer.effectAllowed = 'move'
+    setDragging(true)
+  }
+
+  const handleDragEnd = () => setDragging(false)
+
+  const handleClick = (e: React.MouseEvent) => {
+    const gesture = selectionGestureFor(e)
+    if (gesture) onSelect(gesture)
+    else onOpen()
+  }
+
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <div
+          draggable={!renaming}
+          onDragStart={handleDragStart}
+          onDragEnd={handleDragEnd}
+          onClick={handleClick}
+          aria-selected={isSelected}
+          className={cn(
+            'group relative rounded-lg border cursor-pointer select-none transition-colors flex flex-col overflow-hidden h-full',
+            isSelected ? 'border-primary/50 bg-accent ring-1 ring-primary/30' : 'border-border hover:bg-accent/40',
+            dragging && 'opacity-40',
+          )}
+        >
+          <div className="relative flex items-center justify-center bg-muted/30 aspect-square overflow-hidden">
+            <span className={cn('text-muted-foreground/40', isProcessing && 'opacity-40')}>{docIcon(doc.file_type)}</span>
+            {isProcessing && <div className="absolute inset-0 flex items-center justify-center"><Loader2 className="size-5 text-muted-foreground animate-spin" /></div>}
+          </div>
+          <div className="px-2 py-1.5 flex flex-col gap-0.5">
+            {renaming ? (
+              <input ref={inputRef} type="text" value={renameValue} onChange={(e) => setRenameValue(e.target.value)} onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setRenaming(false) }} onBlur={commitRename} onClick={(e) => e.stopPropagation()} className="text-xs font-medium text-foreground bg-transparent border-b border-foreground/30 outline-none w-full" />
+            ) : (
+              <span className="text-xs text-foreground line-clamp-2 leading-tight">{doc.title || doc.filename}</span>
+            )}
+            <div className="flex items-center gap-1">
+              <span className="text-[9px] text-muted-foreground/50 uppercase">{doc.file_type}</span>
+              {doc.page_count && <span className="text-[9px] text-muted-foreground/40">· {doc.page_count}p</span>}
+            </div>
+            {doc.status === 'failed' && <span className="text-[9px] font-medium text-destructive/80">Failed</span>}
+          </div>
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onClick={onOpen}><ExternalLink className="size-3.5 mr-2" />Open</ContextMenuItem>
+        <ContextMenuItem onClick={onDownload}><Download className="size-3.5 mr-2" />Download</ContextMenuItem>
+        <ContextMenuItem onClick={startRename}><Pencil className="size-3.5 mr-2" />Rename</ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem variant="destructive" onClick={onDelete}><Trash2 className="size-3.5 mr-2" />Delete</ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
+  )
+}
+
+function NewCard({ onCreateNote, onUpload, onCreateFolder }: { onCreateNote: () => void; onUpload: () => void; onCreateFolder: () => void }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <div className="group rounded-lg border border-dashed border-border hover:border-foreground/20 cursor-pointer transition-colors flex flex-col overflow-hidden hover:bg-muted/30 h-full">
+          <div className="flex items-center justify-center aspect-square">
+            <Plus className="size-5 text-muted-foreground/40 group-hover:text-muted-foreground/60 transition-colors" />
+          </div>
+          <div className="px-2 py-1.5 text-center">
+            <span className="text-xs font-medium text-muted-foreground/50">New</span>
+          </div>
+        </div>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start">
+        <DropdownMenuItem onClick={onCreateNote}><NotepadText className="size-3.5 mr-2" />Note</DropdownMenuItem>
+        <DropdownMenuItem onClick={onCreateFolder}><FolderPlus className="size-3.5 mr-2" />Folder</DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={onUpload}><Upload className="size-3.5 mr-2" />Upload files</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+function BreadcrumbDropTarget({ label, path, onNavigate, onDropDocuments, onDropFiles }: {
+  label: string
+  path: string
+  onNavigate: () => void
+  onDropDocuments: (docIds: string[], targetPath: string) => void
+  onDropFiles: (files: File[], targetPath: string) => void
+}) {
+  const [dragOver, setDragOver] = React.useState(false)
+
+  return (
+    <button
+      onClick={onNavigate}
+      onDragEnter={(e) => { e.preventDefault(); e.stopPropagation(); setDragOver(true) }}
+      onDragLeave={(e) => { e.preventDefault(); e.stopPropagation(); setDragOver(false) }}
+      onDragOver={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        e.dataTransfer.dropEffect = e.dataTransfer.types.includes('application/x-llmwiki-item') ? 'move' : 'copy'
+      }}
+      onDrop={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        setDragOver(false)
+        if (e.dataTransfer.types.includes('application/x-llmwiki-item')) {
+          try {
+            const data = JSON.parse(e.dataTransfer.getData('application/x-llmwiki-item'))
+            onDropDocuments(data.ids, path)
+          } catch { /* ignore */ }
+        } else {
+          const files = Array.from(e.dataTransfer.files)
+          if (files.length > 0) onDropFiles(files, path)
+        }
+      }}
+      className={cn(
+        'truncate cursor-pointer rounded px-1 -mx-1 transition-colors text-muted-foreground hover:text-foreground',
+        dragOver && 'bg-primary/15 text-primary ring-1 ring-primary/40',
+      )}
+    >
+      {label}
+    </button>
+  )
+}
+
+function EmptyState({ isRoot, folderName, onUpload, onCreateNote }: { isRoot: boolean; folderName?: string; onUpload?: () => void; onCreateNote?: () => void }) {
+  const label = folderName ? `“${folderName}” 是空的` : 'This folder is empty'
+  return (
+    <div className="flex flex-col items-center justify-center py-20 gap-6">
+      <div className="text-center">
+        <p className="text-sm text-muted-foreground">{isRoot ? 'No files yet' : label}</p>
+        <p className="text-xs text-muted-foreground/60 mt-1">Upload documents or create notes to get started</p>
+      </div>
+      <div className="flex gap-3">
+        <button onClick={onUpload} className="flex flex-col items-center gap-2 px-6 py-4 rounded-lg border border-dashed border-border hover:border-foreground/20 hover:bg-muted/50 transition-colors cursor-pointer">
+          <Upload className="size-5 text-muted-foreground" /><span className="text-xs text-muted-foreground">Upload files</span>
+        </button>
+        <button onClick={onCreateNote} className="flex flex-col items-center gap-2 px-6 py-4 rounded-lg border border-dashed border-border hover:border-foreground/20 hover:bg-muted/50 transition-colors cursor-pointer">
+          <NotepadText className="size-5 text-muted-foreground" /><span className="text-xs text-muted-foreground">New note</span>
+        </button>
+      </div>
+    </div>
+  )
+}

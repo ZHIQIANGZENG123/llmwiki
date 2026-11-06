@@ -1,0 +1,82 @@
+import re
+from fnmatch import fnmatch
+
+from config import settings
+
+MAX_LIST = 50
+MAX_SEARCH = 20
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def clean_annotation_text(s: str, max_len: int = 600) -> str:
+    """Sanitize user annotation text so it can't break layout or read as instructions to the LLM."""
+    if not s:
+        return ""
+    s = _CONTROL_CHARS_RE.sub("", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\n", " ")
+    s = " ".join(s.split())
+    if len(s) > max_len:
+        s = s[:max_len].rstrip() + "…"
+    return s
+
+
+def highlight_quote_and_page(h: dict) -> tuple[str, int | None]:
+    """Return the quote and optional page from whichever anchor shape (pdf, text, legacy webclip) is present."""
+    for key in ("pdfAnchor", "textAnchor", "anchor"):
+        anchor = h.get(key) or {}
+        if not isinstance(anchor, dict):
+            continue
+        text = clean_annotation_text(anchor.get("textContent") or "")
+        if text:
+            page = anchor.get("page") if key == "pdfAnchor" else None
+            return text, page
+    return "", None
+
+
+def deep_link(kb_slug: str, path: str, filename: str, doc_number: int | None = None) -> str:
+    """Absolute app URL for a document.
+
+    `doc_number` opens that document directly (the `?p=` query the wiki route reads);
+    without it the link only lands on the wiki root, which is useless as a citation.
+    """
+    full = (path.rstrip("/") + "/" + filename).lstrip("/")
+    url = f"{settings.APP_URL}/wikis/{kb_slug}/{full}"
+    if doc_number is not None:
+        url += f"?p={doc_number}"
+    return url
+
+
+def glob_match(filepath: str, pattern: str) -> bool:
+    return fnmatch(filepath, pattern)
+
+
+def resolve_path(path: str) -> tuple[str, str]:
+    path_clean = path.lstrip("/")
+    if "/" in path_clean:
+        dir_path = "/" + path_clean.rsplit("/", 1)[0] + "/"
+        filename = path_clean.rsplit("/", 1)[1]
+    else:
+        dir_path = "/"
+        filename = path_clean
+    return dir_path, filename
+
+
+def parse_page_range(pages_str: str, max_page: int) -> list[int]:
+    result = set()
+    for part in pages_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            start, end = start.strip(), end.strip()
+            if not start.isdigit() or not end.isdigit():
+                continue
+            s, e = int(start), int(end)
+            for p in range(max(1, s), min(max_page, e) + 1):
+                result.add(p)
+        elif part.isdigit():
+            p = int(part)
+            if 1 <= p <= max_page:
+                result.add(p)
+    return sorted(result)

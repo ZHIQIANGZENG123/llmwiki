@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""LLM Wiki local-first workspace CLI; `llmwiki -h` lists the commands."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import webbrowser
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent
+API_DIR = REPO_ROOT / "api"
+MCP_DIR = REPO_ROOT / "mcp"
+WEB_DIR = REPO_ROOT / "web"
+
+
+def _load_migration_runner():
+    import importlib.util
+    path = API_DIR / "infra" / "db" / "local_migrations.py"
+    spec = importlib.util.spec_from_file_location("local_migrations", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sanitize_name(name: str) -> str:
+    slug = name.lower().strip()
+    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+    slug = re.sub(r"[\s-]+", "-", slug).strip("-")
+    return slug or "wiki"
+
+
+def cmd_init(workspace: str) -> None:
+    ws = Path(workspace).resolve()
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "wiki").mkdir(exist_ok=True)
+    (ws / ".llmwiki").mkdir(exist_ok=True)
+    (ws / ".llmwiki" / "cache").mkdir(exist_ok=True)
+
+    db_path = ws / ".llmwiki" / "index.db"
+    if db_path.exists():
+        print(f"Workspace already initialized: {ws}")
+        print(f"  index.db: {db_path}")
+        return
+
+    import sqlite3
+    _load_migration_runner().apply_migrations(str(db_path))
+
+    conn = sqlite3.connect(str(db_path))
+
+    import uuid
+    user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "local"))
+    ws_id = str(uuid.uuid4())
+    ws_name = ws.name
+
+    conn.execute(
+        "INSERT INTO workspace (id, name, description, user_id) VALUES (?, ?, '', ?)",
+        (ws_id, ws_name, user_id),
+    )
+
+    doc1_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
+        "file_type, status, content, tags, version, document_number) "
+        "VALUES (?, ?, 'overview.md', 'Overview', '/wiki/', 'wiki/overview.md', 'wiki', "
+        "'md', 'ready', ?, '[]', 0, 1)",
+        (doc1_id, user_id,
+         f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\nNo sources ingested yet."),
+    )
+
+    conn.commit()
+    conn.close()
+
+    overview = ws / "wiki" / "overview.md"
+    if not overview.exists():
+        overview.write_text(
+            f"This wiki tracks research on {ws_name}.\n\n"
+            "## Key Findings\n\nNo sources ingested yet.\n",
+            encoding="utf-8",
+        )
+
+    _index_existing_files(ws, db_path, user_id)
+
+    print(f"✓ Initialized workspace: {ws}")
+    print(f"  wiki/overview.md — created")
+    print(f"  .llmwiki/index.db — created")
+
+
+def _index_existing_files(ws: Path, db_path: Path, user_id: str) -> None:
+    """Index existing files in the workspace into SQLite."""
+    import hashlib
+    import uuid
+    import sqlite3
+
+    ignore_dirs = {".llmwiki", ".git", "node_modules", "__pycache__", ".venv", "venv"}
+    indexed = 0
+
+    conn = sqlite3.connect(str(db_path))
+
+    cursor = conn.execute("SELECT relative_path FROM documents")
+    existing = {row[0] for row in cursor.fetchall()}
+
+    for root_path, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+
+        for filename in files:
+            if filename.startswith("."):
+                continue
+
+            full = Path(root_path) / filename
+            relative = full.relative_to(ws).as_posix()
+
+            if relative in existing:
+                continue
+
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            stat = full.stat()
+
+            parts = relative.split("/")
+            if len(parts) > 1:
+                dir_path = "/" + "/".join(parts[:-1]) + "/"
+            else:
+                dir_path = "/"
+            source_kind = "wiki" if relative.startswith("wiki/") else "source"
+
+            stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+            title = stem.replace("-", " ").replace("_", " ").strip().title()
+
+            # Keep in sync with domain.file_types.SIMPLE_TEXT_TYPES
+            content = None
+            text_types = {
+                "md", "txt", "csv", "svg", "json", "xml",
+                "yaml", "yml", "toml", "ini", "cfg", "rst", "tex", "latex",
+            }
+            if ext in text_types:
+                try:
+                    content = full.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+
+            doc_id = str(uuid.uuid4())
+            content_hash = hashlib.sha256(full.read_bytes()).hexdigest() if full.stat().st_size < 100_000_000 else None
+
+            try:
+                conn.execute(
+                    "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+                    "source_kind, file_type, file_size, status, content, tags, version, "
+                    "content_hash, mtime_ns, last_indexed_at, document_number) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, '[]', 0, ?, ?, datetime('now'), "
+                    "(SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents))",
+                    (doc_id, user_id, filename, title, dir_path, relative,
+                     source_kind, ext or "bin", stat.st_size, content,
+                     content_hash, int(stat.st_mtime_ns)),
+                )
+                indexed += 1
+            except Exception as e:
+                print(f"  Warning: could not index {relative}: {e}", file=sys.stderr)
+
+    conn.commit()
+    conn.close()
+
+    if indexed > 0:
+        print(f"✓ Indexed {indexed} existing file(s)")
+
+
+def _is_loopback(host: str) -> bool:
+    name = host.strip().lower().strip("[]")
+    if name in {"localhost", "::1"}:
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def _primary_lan_address() -> str | None:
+    """Best-effort LAN IPv4 for this machine. Works offline: no packets are sent."""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.2)
+            probe.connect(("10.255.255.255", 1))
+            address = probe.getsockname()[0]
+        if address and not address.startswith("0."):
+            return address
+    except OSError:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = info[4][0]
+            if not address.startswith("127."):
+                return address
+    except OSError:
+        pass
+    return None
+
+
+def _load_or_create_password(ws: Path, explicit: str | None) -> tuple[str, bool]:
+    """Return (password, generated). Persisted so restarts keep the same shared password."""
+    if explicit:
+        return explicit, False
+    token_path = ws / ".llmwiki" / "lan-password.txt"
+    if token_path.exists():
+        stored = token_path.read_text(encoding="utf-8").strip()
+        if stored:
+            return stored, False
+
+    import secrets
+    password = secrets.token_urlsafe(18)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(password + "\n", encoding="utf-8")
+    try:
+        token_path.chmod(0o600)
+    except OSError:
+        pass
+    return password, True
+
+
+def _load_or_create_read_password(ws: Path, explicit: str | None) -> tuple[str, bool]:
+    """Return (read_only_password, generated).
+
+    Readers may browse, search and download but not modify anything, so a single shared
+    read-only password is enough to keep the library tidy without handing out write access.
+    """
+    if explicit:
+        return explicit, False
+    token_path = ws / ".llmwiki" / "lan-read-password.txt"
+    if token_path.exists():
+        stored = token_path.read_text(encoding="utf-8").strip()
+        if stored:
+            return stored, False
+
+    import secrets
+    password = secrets.token_urlsafe(18)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(password + "\n", encoding="utf-8")
+    try:
+        token_path.chmod(0o600)
+    except OSError:
+        pass
+    return password, True
+
+def _next_binary() -> Path:
+    return WEB_DIR / "node_modules" / "next" / "dist" / "bin" / "next"
+
+
+def _node_executable() -> str | None:
+    import shutil
+    return shutil.which("node")
+
+
+def _build_marker(env: dict) -> str:
+    keys = ("NEXT_PUBLIC_MODE", "NEXT_PUBLIC_API_URL", "NEXT_PUBLIC_MCP_URL")
+    return "|".join(f"{key}={env.get(key, '')}" for key in keys)
+
+
+def _standalone_server() -> Path | None:
+    """The prebuilt `output: standalone` entry point, when there is no source checkout.
+
+    Portable bundles ship only `.next/standalone` (already traced and self-contained) and
+    omit `node_modules`, so there is nothing to build and `next start` would fail.
+    """
+    server = WEB_DIR / ".next" / "standalone" / "server.js"
+    if server.exists() and not _next_binary().exists():
+        return server
+    return None
+
+
+def _ensure_web_build(web_env: dict, rebuild: bool) -> None:
+    """Build the Next app once per NEXT_PUBLIC configuration; `next dev` is not production-safe."""
+    if _standalone_server() is not None and not rebuild:
+        print("Using the prebuilt standalone web app (no source checkout to build)")
+        return
+
+    marker_path = WEB_DIR / ".next" / ".llmwiki-build"
+    marker = _build_marker(web_env)
+    up_to_date = (
+        (WEB_DIR / ".next" / "BUILD_ID").exists()
+        and marker_path.exists()
+        and marker_path.read_text(encoding="utf-8").strip() == marker
+    )
+    if up_to_date and not rebuild:
+        return
+
+    node = _node_executable()
+    if node is None:
+        print(
+            "Error: Node.js 20+ is required to build the web app. Install Node.js, then run: "
+            f"cd {WEB_DIR} && npm install",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not _next_binary().exists():
+        print(
+            f"Error: web dependencies not installed. Install Node.js 20+, then run: "
+            f"cd {WEB_DIR} && npm install",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print("Building the web app (first run or configuration changed)…")
+    result = subprocess.run(
+        [node, str(_next_binary()), "build"],
+        cwd=str(WEB_DIR),
+        env=web_env,
+    )
+    if result.returncode != 0:
+        print("Error: web build failed.", file=sys.stderr)
+        sys.exit(result.returncode)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(marker + "\n", encoding="utf-8")
+
+
+def _vendor_pdf_worker(node: str) -> None:
+    """Copy pdf.js's worker into public/ so PDF viewing works with no network access."""
+    script = WEB_DIR / "scripts" / "copy-pdf-worker.mjs"
+    if not script.exists():
+        return
+    if not (WEB_DIR / "node_modules").exists() and (WEB_DIR / "public" / "pdf.worker.min.mjs").exists():
+        # Portable bundle: the worker is already vendored, pdfjs-dist is not installed.
+        return
+    subprocess.run([node, str(script)], cwd=str(WEB_DIR), check=False)
+
+
+def cmd_serve(
+    workspace: str,
+    open_browser: bool = True,
+    host: str = "127.0.0.1",
+    web_port: int = 3000,
+    api_port: int = 8000,
+    mcp_port: int = 8100,
+    password: str | None = None,
+    read_password: str | None = None,
+    public_url: str | None = None,
+    rebuild: bool = False,
+) -> None:
+    ws = Path(workspace).resolve()
+    if not (ws / ".llmwiki" / "index.db").exists():
+        print(f"Workspace not initialized. Run: llmwiki init {ws}", file=sys.stderr)
+        sys.exit(1)
+
+    # A service unit passes the password through the environment so it never appears in
+    # `ps`; an explicit --password still wins.
+    password = password or os.environ.get("LLMWIKI_PASSWORD") or None
+    read_password = read_password or os.environ.get("LLMWIKI_READ_PASSWORD") or None
+
+    lan = not _is_loopback(host)
+    generated = False
+    if lan:
+        password, generated = _load_or_create_password(ws, password)
+        read_password, read_generated = _load_or_create_read_password(ws, read_password)
+        if not public_url:
+            advertised = host if not host.startswith("0.0.0.0") else _primary_lan_address()
+            if not advertised:
+                print(
+                    "Error: could not detect a LAN address. Pass --public-url "
+                    f"http://<this-machine-ip>:{web_port}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            public_url = f"http://{advertised}:{web_port}"
+    resolved_public = (public_url or f"http://localhost:{web_port}").rstrip("/")
+
+    env = os.environ.copy()
+    env["MODE"] = "local"
+    env["WORKSPACE_PATH"] = str(ws)
+    env["DATABASE_URL"] = ""
+    env["APP_URL"] = resolved_public
+    env["API_URL"] = f"{resolved_public}/api"
+    # The API stays on loopback; the web server is the only listening surface, so one
+    # port covers HTTP and the /mcp proxy.
+    env["LOCAL_BIND_HOST"] = "127.0.0.1"
+    env["LOCAL_PUBLIC_URL"] = resolved_public
+    env["LOCAL_LAN_ENABLED"] = "1" if lan else "0"
+    env["LOCAL_AUTH_TOKEN"] = password or ""
+    env["LOCAL_READ_TOKEN"] = read_password or ""
+    env["LOCAL_ALLOWED_HOSTS"] = ",".join(
+        part for part in (resolved_public.split("://", 1)[-1], f"localhost:{web_port}") if part
+    )
+    env["LOCAL_MCP_TRANSPORT"] = "streamable-http"
+    env["LOCAL_MCP_HOST"] = "127.0.0.1"
+    env["LOCAL_MCP_PORT"] = str(mcp_port)
+
+    web_env = env.copy()
+    web_env["NEXT_PUBLIC_MODE"] = "local"
+    # Relative so the build works from any host, and the session cookie stays same-origin.
+    web_env["NEXT_PUBLIC_API_URL"] = "/api"
+    web_env["NEXT_TELEMETRY_DISABLED"] = "1"
+
+    _ensure_web_build(web_env, rebuild)
+
+    node = _node_executable()
+    if node:
+        _vendor_pdf_worker(node)
+
+    print(f"Starting LLM Wiki for: {ws}")
+    print(f"  Web:  {resolved_public}")
+    if lan:
+        print(f"  LAN:  exposed on {host}:{web_port} — shared password required")
+        print(f"  MCP:  {resolved_public}/mcp  (Authorization: Bearer <password>)")
+    else:
+        print(f"  MCP:  llmwiki mcp-config {ws}")
+    if lan and generated:
+        print()
+        print(f"  Workspace password: {password}")
+        print(f"  Saved to: {ws / '.llmwiki' / 'lan-password.txt'}")
+        print("  Share it with people who should have access; pass --password to change it.")
+    print()
+
+    api_proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(api_port)],
+        cwd=str(API_DIR),
+        env=env,
+    )
+
+    mcp_proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "local_server",
+            "--workspace", str(ws),
+            "--transport", "streamable-http",
+            "--port", str(mcp_port),
+        ],
+        cwd=str(MCP_DIR),
+        env=env,
+    )
+
+    standalone = _standalone_server()
+    if standalone is not None:
+        # The standalone server reads its bind address from the environment and resolves
+        # .next/static and public/ relative to its own directory.
+        web_proc = subprocess.Popen(
+            [node, str(standalone)],
+            cwd=str(standalone.parent),
+            env={**web_env, "PORT": str(web_port), "HOSTNAME": host},
+        )
+    else:
+        web_proc = subprocess.Popen(
+            [node, str(_next_binary()), "start", "--port", str(web_port), "--hostname", host],
+            cwd=str(WEB_DIR),
+            env=web_env,
+        )
+
+    _supervise([api_proc, mcp_proc, web_proc], open_browser, resolved_public)
+
+
+def _supervise(
+    procs: list[subprocess.Popen],
+    open_browser: bool,
+    public_url: str = "http://localhost:3000",
+) -> None:
+    """Run until any server exits or the user interrupts, then stop them all."""
+    names = ["API", "MCP", "Web"]
+    _install_termination_handler()
+    try:
+        if open_browser:
+            time.sleep(3)
+            webbrowser.open(f"{public_url}/wikis")
+        while True:
+            time.sleep(0.5)
+            for name, proc in zip(names, procs, strict=False):
+                if proc.poll() is not None:
+                    print(f"\n{name} server exited — shutting down the rest.", file=sys.stderr)
+                    raise _SupervisorDone
+    except (KeyboardInterrupt, _SupervisorDone):
+        print("\nShutting down...")
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in procs:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+def _install_termination_handler() -> None:
+    """Translate SIGTERM into the same orderly shutdown path as Ctrl-C.
+
+    `systemctl stop` sends SIGTERM, whose default action kills the parent immediately and
+    leaves the API/MCP/web children orphaned. Converting it to KeyboardInterrupt runs the
+    `finally` block above instead.
+    """
+    import signal
+
+    def _stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _stop)
+    except (ValueError, OSError):
+        # Not the main thread, or an unsupported platform: keep the default behaviour.
+        pass
+
+
+class _SupervisorDone(Exception):
+    """Internal signal: a supervised process exited on its own."""
+
+
+def cmd_open(workspace: str, open_browser: bool = True, **kwargs) -> None:
+    ws = Path(workspace).resolve()
+    if not (ws / ".llmwiki" / "index.db").exists():
+        cmd_init(str(ws))
+    cmd_serve(str(ws), open_browser=open_browser, **kwargs)
+
+
+def cmd_mcp(workspace: str) -> None:
+    ws = Path(workspace).resolve()
+    if not (ws / ".llmwiki" / "index.db").exists():
+        cmd_init(str(ws))
+
+    # Claude Desktop launches with cwd=~, so chdir for `-m local_server` to resolve.
+    os.chdir(str(MCP_DIR))
+    cmd = [sys.executable, "-m", "local_server", "--workspace", str(ws)]
+    # Windows os.exec* detaches from the parent process, breaking Claude Desktop's stdio lifecycle.
+    if sys.platform == "win32":
+        sys.exit(subprocess.call(cmd))
+    os.execvp(sys.executable, cmd)
+
+
+def cmd_mcp_config(workspace: str, name: str | None = None) -> None:
+    ws = Path(workspace).resolve()
+    server_name = name or f"llmwiki-{_sanitize_name(ws.name)}"
+    llmwiki_path = str(REPO_ROOT / "llmwiki")
+
+    # The current interpreter: shebangs fail on Windows and Claude Desktop won't activate the venv.
+    config = {
+        "mcpServers": {
+            server_name: {
+                "command": sys.executable,
+                "args": [llmwiki_path, "mcp", str(ws)],
+            }
+        }
+    }
+
+    print(f"# Add to claude_desktop_config.json:")
+    print(f"# This MCP server is scoped to: {ws}")
+    print(f"# To use another workspace, add another server entry.")
+    print()
+    print(json.dumps(config, indent=2))
+
+
+def cmd_reindex(workspace: str, assume_yes: bool) -> None:
+    ws = Path(workspace).resolve()
+    db_path = ws / ".llmwiki" / "index.db"
+    if not db_path.exists():
+        print(f"No index found. Run: llmwiki init {ws}", file=sys.stderr)
+        sys.exit(1)
+    if not assume_yes and not _confirm_reindex():
+        sys.exit(1)
+
+    backup_path = _backup_index(db_path)
+    print(f"Backed up the current index to {backup_path}", file=sys.stderr)
+
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DELETE FROM document_references")
+    conn.execute("DELETE FROM document_chunks")
+    conn.execute("DELETE FROM document_pages")
+    conn.execute("DELETE FROM documents")
+    conn.commit()
+
+    cursor = conn.execute("SELECT id, user_id FROM workspace LIMIT 1")
+    row = cursor.fetchone()
+    if not row:
+        print("No workspace found in index.", file=sys.stderr)
+        sys.exit(1)
+    ws_id, user_id = row
+    conn.close()
+
+    _index_existing_files(ws, db_path, user_id)
+    print(f"✓ Reindexed workspace: {ws}")
+
+
+def _confirm_reindex() -> bool:
+    """Ask before discarding index-only state (highlights, comments, replies, course progress, metadata)."""
+    warning = (
+        "Reindex rebuilds search from your files but DISCARDS highlights, comments, agent replies,\n"
+        "course/quiz progress and clip metadata, which live only in .llmwiki/index.db."
+    )
+    print(warning, file=sys.stderr)
+    if not sys.stdin.isatty():
+        print("Re-run with --yes to confirm.", file=sys.stderr)
+        return False
+    return input("Continue? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def _backup_index(db_path: Path) -> Path:
+    import sqlite3
+    backup_path = db_path.with_name(f"index.db.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    source = sqlite3.connect(str(db_path))
+    target = sqlite3.connect(str(backup_path))
+    with target:
+        source.backup(target)
+    source.close()
+    target.close()
+    return backup_path
+
+
+def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("workspace", help="Path to workspace folder")
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Interface for the web server. Use 0.0.0.0 (or a LAN IP) to allow other machines; "
+             "that also requires a shared password.",
+    )
+    parser.add_argument("--port", type=int, default=3000, help="Web/UI port (default: 3000)")
+    # The internal API (8000) and MCP (8100) ports are fixed: web/next.config.ts hardcodes
+    # the /api and /mcp proxy targets, so exposing a flag here would silently break them.
+    parser.add_argument(
+        "--public-url",
+        help="URL other machines use, e.g. http://192.168.1.10:3000 (auto-detected when omitted)",
+    )
+    parser.add_argument(
+        "--password",
+        help="Shared password for LAN access. Generated and saved once under .llmwiki/ when omitted.",
+    )
+    parser.add_argument(
+        "--read-password",
+        help="Optional read-only password: browse, search and download, but no uploads or deletes.",
+    )
+    parser.add_argument("--rebuild", action="store_true", help="Force a fresh web build")
+    parser.add_argument("--no-browser", action="store_true", help="Do not open a browser window")
+
+
+def _serve_kwargs(args: argparse.Namespace) -> dict:
+    return {
+        "host": args.host,
+        "web_port": args.port,
+        "password": args.password,
+        "read_password": args.read_password,
+        "public_url": args.public_url,
+        "rebuild": args.rebuild,
+    }
+
+
+def _make_console_safe() -> None:
+    """Never let a status glyph crash a finished command on a legacy code page.
+
+    A Windows console in GBK (cp936) raises UnicodeEncodeError on the `✓` markers, which
+    aborted `init` after the index had already been committed. Keep the console encoding
+    so Chinese text still renders, and downgrade unencodable characters to `?`.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def main():
+    _make_console_safe()
+    parser = argparse.ArgumentParser(
+        prog="llmwiki",
+        description="LLM Wiki — local-first knowledge workspace",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_open = sub.add_parser("open", help="Init if needed + serve + open browser")
+    _add_serve_arguments(p_open)
+
+    p_init = sub.add_parser("init", help="Initialize a workspace folder")
+    p_init.add_argument("workspace", help="Path to workspace folder")
+
+    p_serve = sub.add_parser("serve", help="Start API + MCP + web servers")
+    _add_serve_arguments(p_serve)
+
+    p_mcp = sub.add_parser("mcp", help="Run stdio MCP server")
+    p_mcp.add_argument("workspace", help="Path to workspace folder")
+
+    p_config = sub.add_parser("mcp-config", help="Print Claude MCP config snippet")
+    p_config.add_argument("workspace", help="Path to workspace folder")
+    p_config.add_argument("--name", help="Custom server name")
+
+    p_reindex = sub.add_parser("reindex", help="Force full rebuild of index")
+    p_reindex.add_argument("workspace", help="Path to workspace folder")
+    p_reindex.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.command == "open":
+        cmd_open(args.workspace, open_browser=not args.no_browser, **_serve_kwargs(args))
+    elif args.command == "init":
+        cmd_init(args.workspace)
+    elif args.command == "serve":
+        cmd_serve(args.workspace, open_browser=not args.no_browser, **_serve_kwargs(args))
+    elif args.command == "mcp":
+        cmd_mcp(args.workspace)
+    elif args.command == "mcp-config":
+        cmd_mcp_config(args.workspace, args.name)
+    elif args.command == "reindex":
+        cmd_reindex(args.workspace, args.yes)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,542 @@
+"""SQLite repositories for local mode: single user, no RLS, FTS5 search."""
+
+import asyncio
+import functools
+import json
+import logging
+import uuid
+from contextlib import asynccontextmanager, suppress
+
+import aiosqlite
+from infra.db.local_migrations import apply_migrations
+from services.highlight_merge import preserve_replies
+
+logger = logging.getLogger(__name__)
+
+_DOC_COLUMNS = (
+    "id, user_id, filename, title, path, relative_path, source_kind, "
+    "file_type, file_size, document_number, status, page_count, "
+    "tags, date, metadata, error_message, version, parser, "
+    "content_hash, mtime_ns, last_indexed_at, stale_since, "
+    "created_at, updated_at"
+)
+
+
+def _row_to_dict(cursor: aiosqlite.Cursor, row: tuple) -> dict:
+    cols = [d[0] for d in cursor.description]
+    d = dict(zip(cols, row, strict=False))
+    if "tags" in d and isinstance(d["tags"], str):
+        d["tags"] = json.loads(d["tags"])
+    if "metadata" in d and isinstance(d["metadata"], str):
+        with suppress(json.JSONDecodeError, TypeError):
+            d["metadata"] = json.loads(d["metadata"])
+    if "elements" in d and isinstance(d["elements"], str):
+        with suppress(json.JSONDecodeError, TypeError):
+            d["elements"] = json.loads(d["elements"])
+    # Local docs are deleted, never archived; callers still expect the hosted `archived` field.
+    if "status" in d:
+        d.setdefault("archived", False)
+    return d
+
+
+def rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
+    """Map a fetched result set to dicts, decoding JSON columns like _row_to_dict."""
+    return [_row_to_dict(cursor, r) for r in rows]
+
+
+# Requests share one aiosqlite connection, so one write's commit would flush another's open transaction.
+_write_lock = asyncio.Lock()
+
+
+def _serialized(method):
+    """Hold the write lock across a committing method; roll back on failure so no transaction leaks."""
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        async with _write_lock:
+            try:
+                return await method(self, *args, **kwargs)
+            except BaseException:  # includes cancellation: never release the lock with a transaction open
+                with suppress(Exception):
+                    await self._db.rollback()
+                raise
+    return wrapper
+
+
+@asynccontextmanager
+async def serialized_write():
+    """Hold the local write lock around a multi-statement write outside the repos."""
+    async with _write_lock:
+        yield
+
+
+async def create_pool(db_path: str, init_schema: bool = True) -> aiosqlite.Connection:
+    if init_schema:
+        await asyncio.to_thread(apply_migrations, db_path)
+    db = await aiosqlite.connect(db_path)
+    db.row_factory = None
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA foreign_keys=ON")
+    await db.execute("PRAGMA busy_timeout=5000")
+    return db
+
+
+class SQLiteDocumentRepository:
+    def __init__(self, db: aiosqlite.Connection):
+        self._db = db
+
+    async def list_by_kb(self, kb_id: str, *, path: str | None = None, archived: bool = False) -> list[dict]:
+        if path:
+            cursor = await self._db.execute(
+                f"SELECT {_DOC_COLUMNS} FROM documents "
+                "WHERE path = ? AND status != 'failed' "
+                "ORDER BY filename",
+                (path,),
+            )
+        else:
+            cursor = await self._db.execute(
+                f"SELECT {_DOC_COLUMNS} FROM documents "
+                "WHERE status != 'failed' ORDER BY filename",
+            )
+        rows = await cursor.fetchall()
+        return [_row_to_dict(cursor, r) for r in rows]
+
+    async def get(self, doc_id: str) -> dict | None:
+        cursor = await self._db.execute(
+            f"SELECT {_DOC_COLUMNS} FROM documents WHERE id = ?", (doc_id,),
+        )
+        row = await cursor.fetchone()
+        return _row_to_dict(cursor, row) if row else None
+
+    async def get_content(self, doc_id: str) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT id, content, version FROM documents WHERE id = ?", (doc_id,),
+        )
+        row = await cursor.fetchone()
+        return _row_to_dict(cursor, row) if row else None
+
+    async def find_by_path(
+        self, kb_id: str, user_id: str, filename: str, path: str,
+    ) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT * FROM documents WHERE user_id = ? AND filename = ? AND path = ?",
+            (user_id, filename, path),
+        )
+        row = await cursor.fetchone()
+        return _row_to_dict(cursor, row) if row else None
+
+    @_serialized
+    async def create_note(
+        self, kb_id: str, user_id: str, filename: str, path: str,
+        title: str, content: str, tags: list[str],
+    ) -> dict:
+        doc_id = str(uuid.uuid4())
+        relative_path = (path.rstrip("/") + "/" + filename).lstrip("/")
+        source_kind = "wiki" if path.strip("/").startswith("wiki") else "source"
+
+        cursor = await self._db.execute(
+            "SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents",
+        )
+        row = await cursor.fetchone()
+        doc_number = row[0]
+
+        await self._db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
+            "file_type, file_size, status, content, tags, version, document_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'md', ?, 'ready', ?, ?, 0, ?)",
+            (doc_id, user_id, filename, title, path, relative_path, source_kind,
+             len(content.encode("utf-8")), content, json.dumps(tags), doc_number),
+        )
+        await self._db.commit()
+        return await self.get(doc_id)
+
+    @_serialized
+    async def update_content(self, doc_id: str, user_id: str, content: str) -> dict | None:
+        cursor = await self._db.execute(
+            "UPDATE documents SET content = ?, file_size = ?, version = version + 1, "
+            "updated_at = datetime('now'), stale_since = NULL WHERE id = ? "
+            "RETURNING id, content, version",
+            (content, len(content.encode("utf-8")), doc_id),
+        )
+        row = await cursor.fetchone()
+        await self._db.commit()
+        return _row_to_dict(cursor, row) if row else None
+
+    @_serialized
+    async def update_metadata(self, doc_id: str, user_id: str, **fields) -> dict | None:
+        if "metadata" in fields:
+            # Read-modify-write: hold the write lock across processes (the MCP server writes this file too).
+            await self._db.execute("BEGIN IMMEDIATE")
+        updates = []
+        params = []
+        for key, value in fields.items():
+            if key == "tags":
+                updates.append("tags = ?")
+                params.append(json.dumps(value))
+            elif key == "metadata":
+                current = await self.get(doc_id)
+                existing = current["metadata"] if current and isinstance(current["metadata"], dict) else {}
+                updates.append("metadata = ?")
+                params.append(json.dumps({**existing, **value}))
+            else:
+                updates.append(f"{key} = ?")
+                params.append(value)
+
+        if not updates:
+            return None
+
+        updates.append("updated_at = datetime('now')")
+        params.append(doc_id)
+
+        sql = f"UPDATE documents SET {', '.join(updates)} WHERE id = ?"
+        await self._db.execute(sql, params)
+        await self._db.commit()
+        return await self.get(doc_id)
+
+    @_serialized
+    async def archive(self, doc_id: str, user_id: str) -> bool:
+        await self._db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
+        await self._db.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
+        cursor = await self._db.execute(
+            "DELETE FROM documents WHERE id = ?", (doc_id,),
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    @_serialized
+    async def bulk_archive(self, doc_ids: list[str], user_id: str) -> None:
+        if not doc_ids:
+            return
+        placeholders = ",".join("?" for _ in doc_ids)
+        await self._db.execute(f"DELETE FROM document_pages WHERE document_id IN ({placeholders})", doc_ids)
+        await self._db.execute(f"DELETE FROM document_chunks WHERE document_id IN ({placeholders})", doc_ids)
+        await self._db.execute(
+            f"DELETE FROM documents WHERE id IN ({placeholders})", doc_ids,
+        )
+        await self._db.commit()
+
+    async def get_kb_id(self, doc_id: str) -> str | None:
+        cursor = await self._db.execute(
+            "SELECT id FROM workspace LIMIT 1",
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def get_by_source_url(self, url: str) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT id, (SELECT id FROM workspace LIMIT 1) as knowledge_base_id, "
+            "title, path, filename, version, highlights "
+            "FROM documents "
+            "WHERE status != 'failed' "
+            "AND json_extract(metadata, '$.source_url') = ? "
+            "AND COALESCE(json_extract(metadata, '$.asset'), 0) = 0 "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (url,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        result = _row_to_dict(cursor, row)
+        result["highlights"] = self._parse_highlights(result.get("highlights"))
+        return result
+
+    async def get_highlights(self, doc_id: str) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT id, version, highlights FROM documents WHERE id = ?", (doc_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        result = _row_to_dict(cursor, row)
+        result["highlights"] = self._parse_highlights(result.get("highlights"))
+        return result
+
+    @_serialized
+    async def replace_highlights(
+        self, doc_id: str, user_id: str, highlights: list[dict],
+        expected_version: int | None = None,
+    ) -> dict | None:
+        # RESERVED lock up front so concurrent upserts wait instead of stale-reading and clobbering.
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            check = await self._db.execute(
+                "SELECT version, highlights FROM documents WHERE id = ?", (doc_id,),
+            )
+            existing = await check.fetchone()
+            if not existing:
+                await self._db.rollback()
+                return None
+            if expected_version is not None and existing[0] != expected_version:
+                await self._db.rollback()
+                return {"conflict": True}
+            old_highlights = self._parse_highlights(existing[1])
+            preserve_replies(highlights, old_highlights)
+
+            payload = json.dumps(highlights)
+            cursor = await self._db.execute(
+                "UPDATE documents SET highlights = ?, "
+                "version = version + 1, updated_at = datetime('now') "
+                "WHERE id = ? "
+                "RETURNING id, version, highlights",
+                (payload, doc_id),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                await self._db.rollback()
+                return None
+            result = _row_to_dict(cursor, row)
+            new_highlights = self._parse_highlights(result.get("highlights"))
+            result["highlights"] = new_highlights
+            await self._recompute_chunks_for_doc(doc_id, old_highlights, new_highlights)
+            await self._db.commit()
+            return result
+        except Exception:
+            with suppress(Exception):
+                await self._db.rollback()
+            raise
+
+    @_serialized
+    async def upsert_highlight(
+        self, doc_id: str, user_id: str, highlight: dict,
+        expected_version: int | None = None,
+    ) -> dict | None:
+        """Atomic single-entry upsert by id."""
+        new_id = highlight.get("id")
+        if not new_id:
+            return None
+
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await self._db.execute(
+                "SELECT version, highlights FROM documents WHERE id = ?", (doc_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                await self._db.rollback()
+                return None
+            version, highlights_raw = row[0], row[1]
+            if expected_version is not None and version != expected_version:
+                await self._db.rollback()
+                return {"conflict": True}
+
+            current = self._parse_highlights(highlights_raw)
+            preserve_replies([highlight], current)
+            replaced = False
+            next_list: list[dict] = []
+            for h in current:
+                if isinstance(h, dict) and h.get("id") == new_id:
+                    next_list.append(highlight)
+                    replaced = True
+                else:
+                    next_list.append(h)
+            if not replaced:
+                if len(current) >= 500:
+                    await self._db.rollback()
+                    return {"limit_exceeded": True}
+                next_list.append(highlight)
+
+            payload = json.dumps(next_list)
+            cursor = await self._db.execute(
+                "UPDATE documents SET highlights = ?, "
+                "version = version + 1, updated_at = datetime('now') "
+                "WHERE id = ? "
+                "RETURNING id, version, highlights",
+                (payload, doc_id),
+            )
+            result_row = await cursor.fetchone()
+            if not result_row:
+                await self._db.rollback()
+                return None
+            result = _row_to_dict(cursor, result_row)
+            new_highlights = self._parse_highlights(result.get("highlights"))
+            result["highlights"] = new_highlights
+            await self._recompute_chunks_for_doc(doc_id, current, new_highlights)
+            await self._db.commit()
+            return result
+        except Exception:
+            with suppress(Exception):
+                await self._db.rollback()
+            raise
+
+    @_serialized
+    async def delete_highlight(
+        self, doc_id: str, user_id: str, highlight_id: str,
+        expected_version: int | None = None,
+    ) -> dict | None:
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await self._db.execute(
+                "SELECT version, highlights FROM documents WHERE id = ?", (doc_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                await self._db.rollback()
+                return None
+            version, highlights_raw = row[0], row[1]
+            if expected_version is not None and version != expected_version:
+                await self._db.rollback()
+                return {"conflict": True}
+
+            current = self._parse_highlights(highlights_raw)
+            next_list = [
+                h for h in current
+                if not (isinstance(h, dict) and h.get("id") == highlight_id)
+            ]
+            if len(next_list) == len(current):
+                await self._db.rollback()
+                return {"id": doc_id, "version": version, "highlights": current}
+
+            payload = json.dumps(next_list)
+            cursor = await self._db.execute(
+                "UPDATE documents SET highlights = ?, "
+                "version = version + 1, updated_at = datetime('now') "
+                "WHERE id = ? "
+                "RETURNING id, version, highlights",
+                (payload, doc_id),
+            )
+            result_row = await cursor.fetchone()
+            if not result_row:
+                await self._db.rollback()
+                return None
+            result = _row_to_dict(cursor, result_row)
+            new_highlights = self._parse_highlights(result.get("highlights"))
+            result["highlights"] = new_highlights
+            await self._recompute_chunks_for_doc(doc_id, current, new_highlights)
+            await self._db.commit()
+            return result
+        except Exception:
+            with suppress(Exception):
+                await self._db.rollback()
+            raise
+
+    @_serialized
+    async def reapply_highlights(self, doc_id: str) -> None:
+        """Re-materialize stored highlight annotations onto freshly rebuilt chunks."""
+        current = await self.get_highlights(doc_id)
+        if not current or not current["highlights"]:
+            return
+        await self._recompute_chunks_for_doc(doc_id, [], current["highlights"])
+        await self._db.commit()
+
+    async def _recompute_chunks_for_doc(
+        self, doc_id: str,
+        old_highlights: list[dict], new_highlights: list[dict],
+    ) -> None:
+        """Rewrite annotations on chunks touched by old ∪ new highlights (the union clears deleted ones)."""
+        from services.chunk_text_index import ChunkTextIndex
+        from services.highlight_chunks import all_affected_chunks, iter_chunks_with_annotations
+        from services.types import ChunkRecord
+
+        cursor = await self._db.execute(
+            "SELECT id, chunk_index, source_content, page, start_char "
+            "FROM document_chunks WHERE document_id = ? "
+            "ORDER BY chunk_index",
+            (doc_id,),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+        chunks = [
+            ChunkRecord(
+                id=r[0], chunk_index=r[1],
+                source_content=r[2] or "",
+                page=r[3], start_char=r[4],
+            )
+            for r in rows
+        ]
+        index = ChunkTextIndex(chunks)
+        affected = all_affected_chunks(index, old_highlights, new_highlights)
+        if not affected:
+            return
+
+        for chunk, anno_text, has_hl, new_content in iter_chunks_with_annotations(
+            index, affected, new_highlights,
+        ):
+            await self._db.execute(
+                "UPDATE document_chunks "
+                "SET annotations_text = ?, has_highlight = ?, content = ? "
+                "WHERE id = ?",
+                (anno_text, 1 if has_hl else 0, new_content, chunk.id),
+            )
+
+    @_serialized
+    async def set_metadata_field(self, doc_id: str, key: str, value) -> None:
+        cursor = await self._db.execute(
+            "SELECT metadata FROM documents WHERE id = ?", (doc_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return
+        meta = {}
+        if row[0]:
+            try:
+                meta = json.loads(row[0]) or {}
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        meta[key] = value
+        await self._db.execute(
+            "UPDATE documents SET metadata = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(meta), doc_id),
+        )
+        await self._db.commit()
+
+    @staticmethod
+    def _parse_highlights(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    @_serialized
+    async def create_asset(
+        self, doc_id: str, user_id: str, filename: str, path: str,
+        title: str, file_type: str, file_size: int, metadata: dict,
+    ) -> dict | None:
+        relative_path = (path.rstrip("/") + "/" + filename).lstrip("/")
+
+        cursor = await self._db.execute(
+            "SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents",
+        )
+        row = await cursor.fetchone()
+        doc_number = row[0]
+
+        await self._db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
+            "file_type, file_size, status, content, tags, version, document_number, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'asset', ?, ?, 'ready', NULL, '[]', 0, ?, ?)",
+            (doc_id, user_id, filename, title, path, relative_path, file_type,
+             file_size, doc_number, json.dumps(metadata)),
+        )
+        await self._db.commit()
+        return await self.get(doc_id)
+
+
+class SQLiteChunkRepository:
+    def __init__(self, db: aiosqlite.Connection):
+        self._db = db
+
+    @_serialized
+    async def store(self, doc_id: str, user_id: str, kb_id: str, chunks: list) -> None:
+        await self._db.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
+        if not chunks:
+            await self._db.commit()
+            return
+
+        # source_content is immutable; content diverges once highlight annotations are materialized.
+        await self._db.executemany(
+            "INSERT INTO document_chunks "
+            "(id, document_id, chunk_index, content, source_content, page, start_char, token_count, header_breadcrumb) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (str(uuid.uuid4()), doc_id, c.index, c.content, c.content, c.page,
+                 c.start_char, c.token_count, c.header_breadcrumb)
+                for c in chunks
+            ],
+        )
+        await self._db.commit()
+        logger.info("Stored %d chunks for doc %s", len(chunks), doc_id[:8])
+
