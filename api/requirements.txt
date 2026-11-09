@@ -13,6 +13,8 @@ sentry-sdk[fastapi]==2.59.0
 pyyaml==6.0.3
 aioboto3==15.5.0
 openpyxl==3.1.5
+# Legacy .xls (BIFF) extraction; xlrd 2.x reads only that format, so it complements openpyxl.
+xlrd==2.0.2
 beautifulsoup4==4.13.4
 lxml==6.1.0
 markdown-it-py==4.0.0

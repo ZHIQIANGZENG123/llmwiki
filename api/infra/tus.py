@@ -109,7 +109,7 @@ ALLOWED_EXTENSIONS = {
     ".docx": "docx", ".doc": "doc",
     ".png": "png", ".jpg": "jpg", ".jpeg": "jpeg",
     ".webp": "webp", ".gif": "gif",
-    ".xlsx": "xlsx", ".csv": "csv",
+    ".xlsx": "xlsx", ".xls": "xls", ".csv": "csv",
     ".html": "html", ".htm": "html",
 }
 CONTENT_TYPES = {
@@ -121,6 +121,7 @@ CONTENT_TYPES = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
     "webp": "image/webp", "gif": "image/gif",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "xls": "application/vnd.ms-excel",
     "csv": "text/csv",
     "html": "text/html", "htm": "text/html",
 }

@@ -95,21 +95,19 @@ def _encode_file_base64(path: Path) -> str:
 
 
 def _extract_spreadsheet_content(file_path: Path) -> list[tuple[str, str]]:
-    from openpyxl import load_workbook
+    """One `name | name` line per row, which the file viewer rebuilds into a table.
 
-    workbook = load_workbook(str(file_path), read_only=True, data_only=True)
-    try:
-        sheets: list[tuple[str, str]] = []
-        for sheet_name in workbook.sheetnames:
-            worksheet = workbook[sheet_name]
-            rows = [
-                " | ".join(str(cell) if cell is not None else "" for cell in row)
-                for row in worksheet.iter_rows(values_only=True)
-            ]
-            sheets.append((sheet_name, "\n".join(rows)))
-        return sheets
-    finally:
-        workbook.close()
+    Shares the row extraction with `services.spreadsheet_extract` so `.xls`, `.xlsx` and `.csv`
+    all take the same path — this used to be a second openpyxl-only copy that silently produced
+    nothing for legacy workbooks.
+    """
+    from services.spreadsheet_extract import rows_by_sheet
+
+    ext = file_path.suffix.lstrip(".").lower()
+    return [
+        (sheet_name, "\n".join(" | ".join(row) for row in rows))
+        for sheet_name, rows in rows_by_sheet(str(file_path), ext)
+    ]
 
 
 def _extract_html_content(file_path: Path) -> str:

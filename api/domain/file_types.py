@@ -2,7 +2,10 @@
 
 PDF_TYPES = frozenset({"pdf"})
 OFFICE_TYPES = frozenset({"pptx", "ppt", "docx", "doc"})
-SPREADSHEET_TYPES = frozenset({"xlsx"})
+# `xls` is the pre-2007 binary format: openpyxl cannot read it, so extraction goes through
+# xlrd (services/spreadsheet_extract.py). Preview does not depend on this — the ZetaOffice
+# viewer opens the original file either way.
+SPREADSHEET_TYPES = frozenset({"xlsx", "xls"})
 IMAGE_TYPES = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
 HTML_TYPES = frozenset({"html", "htm"})
 
