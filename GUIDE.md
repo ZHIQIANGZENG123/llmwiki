@@ -180,6 +180,28 @@ D:\我的知识库\
 
 **搜索行为**：输入 2 个字符以上，会向 `/v1/search` 查正文，在网格上方显示「In document contents」结果区，每条带标题、页码、上下文片段，点一下直接打开文档。
 
+**表格预览（xlsx / xls）**：走 **ZetaOffice**——LibreOffice 编译成的 WebAssembly 版，在 iframe 里渲染原件，公式、样式、合并单元格、100 行以后的数据都在（旧的文本表格视图只保留每个 sheet 前 100 行）。运行时打不开时会给出原因，「改用表格视图」可退回原来的纯文本表格。
+
+体积要心里有数：运行时**磁盘上约 250 MiB**（`soffice.wasm` 154 MiB + `soffice.data` 95 MiB），CDN 走 Brotli 传输约 53 MB，浏览器按 URL 缓存一周。
+
+> **中文字体是要单独装的**：上游运行时自带 138 个字体，一个中日韩字库都没有，中文会显示成方块（□□）。查看器会在引擎启动前把 `<运行时目录>/fonts/cjk.ttf` 写进 LibreOffice 的字体目录——这是唯一还来得及的时机（启动后注入不再生效）。
+>
+> ```powershell
+> # 连网机器上：下载 4 个运行时文件 + Noto Sans SC（SIL OFL 1.1，约 10 MiB）
+> node web/scripts/fetch-zetaoffice-runtime.mjs --cjk-font
+> # 或者换成自己可再分发的字体
+> $env:ZETAOFFICE_CJK_FONT_URL = "https://你的镜像/思源黑体.ttf"
+> node web/scripts/fetch-zetaoffice-runtime.mjs
+> ```
+>
+> 换字体后要留意缓存：运行时目录带 `Cache-Control: max-age=604800`，同一浏览器一周内还会用旧的 `cjk.ttf`，验证时用无痕窗口或换一个 URL（`?base=` 指向新目录）。
+
+> 离线/内网部署：先在联网机器上执行 `node web/scripts/fetch-zetaoffice-runtime.mjs`，把运行时装进 `web/public/zetaviewer/runtime/`（已 gitignore），再打包；否则查看器会退回文本表格。
+>
+> 自托管时注意：Next 的静态响应不对 `application/wasm` 做压缩，所以**局域网首次打开要传约 250 MiB**（之后走浏览器缓存）。想省这一下，可以在前面挂 Caddy/nginx 开 Brotli/gzip 并预压缩该目录。
+>
+> 另外 `/zetaviewer/*` 必须带 `Cross-Origin-Opener-Policy: same-origin` 与 `Cross-Origin-Embedder-Policy: require-corp`（已写进 `web/next.config.ts`）——LibreOffice 用 pthreads，需要 `SharedArrayBuffer`，而浏览器只对跨源隔离的文档暴露它。若在前面加了反代，记得透传这两个头。
+
 ### 5.2 搜索（两个入口，行为一致）
 
 | 入口 | 快捷键 | 搜索范围 |
@@ -193,6 +215,8 @@ D:\我的知识库\
 - 英文不区分大小写
 - 多个词用空格分隔是 **AND**（同一段内都要出现），例如 `MOSA 架构`
 - 中文能搜到句中任意位置——后端用 `LIKE` 绕过了 FTS5 的英文分词器（详见[已知限制](#11-已知限制)）
+- **文件名与标题也参与匹配**：正文里压根没出现该词、但文件叫 `系统架构.pdf` 的文档同样会列出（这类结果的摘要取文件名，不带页码）
+- MCP 侧（AI 通过 `search` 工具检索）与网页端行为一致：含中文走子串匹配，纯英文走 FTS5
 
 举例：输入 `红黑` 会列出所有正文出现「红黑」的文档，每条显示命中页码和上下文。
 
@@ -246,7 +270,51 @@ ollama pull qwen2.5:14b
 
 > 工具调用（tool calling）是硬门槛。7B 级别模型通常不稳定，建议 14B 以上。
 
-### 6.4 让 AI 自动维护
+### 6.4 灵犀应答（内置 pi agent）
+
+网页右下角的问答面板（「灵犀应答」）不是浏览器直接调模型，而是后端拉起一个 **pi** 子进程：
+
+```
+浏览器 ──SSE──► /v1/chat/stream ──spawn──► pi --mode rpc ──MCP──► 本机 MCP ──► 知识库
+                                                └──► models.json 指定的模型
+```
+
+模型 Key 永远不进浏览器。pi 只被授予**只读**工具（`guide` / `list_knowledge_bases` / `search` / `read` / `ping`），
+因为 pi 本质是 coding agent，默认自带的 read/bash/glob/grep 会去读它落脚的目录、拿那里的文件冒充知识库答案。
+
+**安装**（在线机器上一次即可）：
+
+```powershell
+npm install --prefix .pi-runtime @earendil-works/pi-coding-agent
+$env:LLMWIKI_PI_BIN = "node $PWD\.pi-runtime\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js"
+```
+
+Windows 上必须给**完整路径**（`CreateProcess` 跑不了 npm 的 `.cmd` 垫片），Linux 上可以用 bundle 相对路径。
+
+**配置**在 `.pi-agent/`（随仓库发布，不含任何密钥）：
+
+| 文件 | 作用 |
+|---|---|
+| `models.json` | 模型清单。默认内置 `deepseek`（读 `DEEPSEEK_API_KEY`）+ 一个 `local` provider 指向 `http://127.0.0.1:8000/v1`（vLLM / Ollama） |
+| `mcp.json` | MCP 服务器。令牌写成 `${LLMWIKI_TOKEN}`，由后端注入，不落盘 |
+| `APPEND_SYSTEM.md` | 追加给 pi 的系统提示：先 `guide`、检索用名词短语、必须给出处、检索不到就说没找到 |
+
+验证 MCP 是否通（不需要模型）：
+
+```powershell
+$env:PI_CODING_AGENT_DIR = "$PWD\.pi-agent"
+$env:LLMWIKI_TOKEN = "<工作区口令>"
+node .pi-runtime\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js mcp list
+# llmwiki: connected, 14 tools
+```
+
+**换模型**：改 `models.json` 里的 `providers.local.models[0].id` 与 `baseUrl`，再用环境变量指定默认：
+
+```powershell
+$env:LLMWIKI_PI_PROVIDER = "local"; $env:LLMWIKI_PI_MODEL = "qwen2.5-14b-instruct"
+```
+
+### 6.5 让 AI 自动维护
 
 把这段提示词配成定时任务（客户端自带的定时/工作流，或系统计划任务）：
 
@@ -416,7 +484,7 @@ cd C:\Users\zzq\Desktop\知识库\llmwiki-master\llmwiki-master
 
 ## 11. 已知限制
 
-1. **MCP 的中文检索**：`search` 工具走 `chunks_fts MATCH`，分词器是 `porter unicode61`——英文词干化，中文被当作一个不可分的整词，所以中文查询基本落空。网页端已用 `LIKE` 绕过，MCP 侧尚未修。
+1. **中文检索已修，但机制是「兜底」而非「分词」**：`chunks_fts` 的分词器仍是 `porter unicode61`，中文在其中是一个不可分的整词。因此 MCP 的 `search` 与网页 `/v1/search` 都改为：查询里含 CJK 字符时走 `LIKE` 子串匹配（多词为 AND），纯 ASCII 查询仍走 FTS5（保留英文词干化）。代价是中文查询没有词干与相关度排序，且随库增长是线性扫描；要让中文真正「按词」检索，需要给 `chunks_fts` 换 `trigram` 分词器或接 embedding（见第 3 条）。
 2. **Chrome 扩展在局域网模式不可用**：它直接请求 API 且不带凭据。服务端已支持 `Bearer`，只差扩展端增加口令输入框。临时方案：用 Web UI 上传，或直接把文件放进工作区目录（后台监听器会索引）。
 3. **搜索是字面匹配**，不支持语义/同义词。要"按意思找"需要接 embedding 模型（代码里预留了 `VOYAGE_API_KEY` 但未实现）。
 4. **单租户**：没有按用户隔离，一个口令即整库权限。
@@ -433,10 +501,14 @@ cd C:\Users\zzq\Desktop\知识库\llmwiki-master\llmwiki-master
 | 鉴权（新增） | 共享口令登录、HMAC 会话 Cookie、`/v1/files` 鉴权 |
 | 局域网 | `LOCAL_*` 配置、Host/Origin 白名单化 |
 | 检索（新增） | `/v1/search` 全文检索、`/v1/folders` 目录列举 |
+| 中文检索（新增） | MCP `search` 与 `/v1/search` 统一：含 CJK 走 `LIKE` 子串匹配、纯 ASCII 走 FTS5；标题/文件名也参与匹配 |
+| 表格预览（新增） | `web/public/zetaviewer/` 内嵌 ZetaOffice（LibreOffice WASM）渲染 xlsx/xls，带「改用表格视图」兜底；引擎启动前注入 CJK 字体 |
+| 灵犀应答（新增） | `.pi-agent/` 内置 pi agent 配置（models/mcp/APPEND_SYSTEM），只读工具白名单，令牌走环境变量 |
+| 表格抽取（新增） | `.xls`（BIFF）经 xlrd 抽取，上传白名单与处理类型一并放开；`spreadsheet_extract` 成为 xlsx/xls/csv 的唯一入口 |
 | MCP | 可配置 host + Bearer 令牌 |
 | CLI | `--host/--port/--password/--rebuild`、standalone 启动、GBK 控制台崩溃修复、SIGTERM 优雅退出 |
 | 前端 | 字体本地化（`geist`）、本地登录页、相对 API 路径、中文 slug 路由修复、FilesGrid 返回按钮/空目录/内容搜索/打开文档修复 |
-| 离线打包 | `tools/` 下 4 个脚本（Windows/Linux 打包、WPS→PDF 兼容层、Ollama agent） |
+| 离线打包 | `tools/` 下 4 个脚本（Windows/Linux 打包、WPS→PDF 兼容层、Ollama agent）、`web/scripts/fetch-zetaoffice-runtime.mjs` 取 WASM 运行时 |
 | 文档 | 本文件、`DEPLOYMENT.md`、README、`.env.example` |
 
 > 当前副本不是 git 仓库。建议 `git init` 并把上游设为 `upstream` 远程，以便日后合并上游更新。

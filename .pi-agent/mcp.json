@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "llmwiki": {
+      "url": "http://127.0.0.1:8100/mcp",
+      "headers": {
+        "Authorization": "Bearer ${LLMWIKI_TOKEN}"
+      }
+    }
+  }
+}

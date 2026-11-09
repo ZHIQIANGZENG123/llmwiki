@@ -125,16 +125,23 @@ Windows 上打出的包**可以**直接给 Debian 12：关键在于绕开两处�
 
 ```powershell
 # 注意：执行策略可能禁止直接运行 .ps1，用 -ExecutionPolicy Bypass
-powershell -ExecutionPolicy Bypass -File tools\build-bundle-windows.ps1 -Out C:\llmwiki-bundle
+powershell -ExecutionPolicy Bypass -File tools\build-bundle-windows.ps1 -Out C:\llmwiki-bundle `
+    -PiDir C:\path\to\.pi-runtime
 ```
 
-产物：`C:\llmwiki-bundle.tar.gz`，约 114 MB。
+`-PiDir` 指向 `npm install --prefix <dir> @earendil-works/pi-coding-agent` 出来的目录；不给它，目标机上的
+「灵犀应答」就没有 agent 可用（打包脚本只告警，不中断）。
+
+产物：`C:\llmwiki-bundle.tar.gz`，约 **221 MB**。体积主要来自三块：ZetaOffice 的 WASM 运行时（磁盘 250 MB、
+gzip 后约 36 MB）、Linux 版 Python 依赖 140 MB、Node 运行时 120 MB。
 
 | 组件 | 怎么做到跨平台 |
 |---|---|
 | Web 运行时 | `next.config.ts` 的 `output: "standalone"` 会把前端裁成一个自包含目录。里面唯一的原生产物是 Windows 版 `sharp`，而本项目**没有用 `next/image`**，删掉它之后整个目录是纯 JS，可直接在 Linux 上跑 |
 | Python 依赖 | 用 `uv pip install --python-platform x86_64-manylinux_2_28 --python-version 3.11` 按**目标环境**解析。普通 `pip download --platform` 不行：它仍用构建机的环境标记，会在 Windows 上把 `mcp` 的 `pywin32` 依赖算进来而失败 |
 | Node 运行时 | 从 nodejs.org 官方 linux tarball 里**只解出 `bin/node`**；`bin/npm`、`bin/npx` 是符号链接，Windows 的 tar 建不了 |
+| pi agent | 整个 npm 安装树原样搬到 `pi/`；`deploy.sh` 用包内 Node 拉起它，并把 `PI_CODING_AGENT_DIR` 指到 `repo/.pi-agent`。**目标机不需要装 node、也不需要 `pi` 在 PATH 上** |
+| 表格预览 | `web/public/zetaviewer/runtime/` 的 WASM 运行时随包分发，离线也能渲染 xlsx/xls；CJK 字体（10 MB）在同一目录下 |
 | 可执行位 | Windows 的 tar 会把所有文件记成 `0666`，导致解包后 `deploy.sh`、`node` 不可执行。打包脚本先用 `tar -cf` 出裸归档，再用 Python 重写并压成 gz，把需要的条目恢复成 `0755` |
 
 打包脚本会自检：`pylib` 里不能有 `.pyd`、`.so` 必须是 ELF（读 magic 判断），Web 目录里不能有 `.node`，`runtime/bin/node` 必须是 ELF。任一不满足就直接报错，不会产出坏包。

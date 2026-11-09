@@ -146,6 +146,10 @@ Ok 'no native binaries in the web app'
 if (-not (Test-Path (Join-Path $sa 'public\pdf.worker.min.mjs'))) {
     Warn 'pdf.worker.min.mjs missing — PDF previews would need the network'
 }
+# Not fatal: the app falls back to its plain table view when the WASM runtime is unreachable.
+if (-not (Test-Path (Join-Path $sa 'public\zetaviewer\runtime\soffice.wasm'))) {
+    Warn 'zetaviewer runtime missing — spreadsheet preview would need the network (run: node web\scripts\fetch-zetaoffice-runtime.mjs)'
+}
 $stat = Get-ChildItem $sa -Recurse -File | Measure-Object Length -Sum
 Ok ("web app: {0:N1} MB / {1} files" -f ($stat.Sum / 1MB), $stat.Count)
 

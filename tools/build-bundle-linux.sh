@@ -110,6 +110,10 @@ printf 'NEXT_PUBLIC_MODE=local|NEXT_PUBLIC_API_URL=/api|NEXT_PUBLIC_MCP_URL=\n' 
 [ -f "$REPO/web/public/pdf.worker.min.mjs" ] || \
   die "web/public/pdf.worker.min.mjs missing — PDF previews would need the network"
 
+# Not fatal: the app falls back to its plain table view when the WASM runtime is unreachable.
+[ -f "$REPO/web/public/zetaviewer/runtime/soffice.wasm" ] || \
+  warn "zetaviewer runtime missing — spreadsheet preview would need the network (run: node web/scripts/fetch-zetaoffice-runtime.mjs)"
+
 # ---------------------------------------------------------------- wheels
 log "Downloading Python wheels for $PY_VER"
 WHEELS="$OUT/vendor/wheels"
