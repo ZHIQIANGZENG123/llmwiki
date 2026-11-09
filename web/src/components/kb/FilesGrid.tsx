@@ -28,7 +28,7 @@ import { NoteFormattingButtons } from '@/components/editor/NoteToolbar'
 import type { Editor } from '@tiptap/react'
 import {
   PdfDocViewer, ImageViewer, HtmlDocViewer, ContentViewer,
-  UnsupportedViewer, ProcessingViewer, FailedViewer,
+  UnsupportedViewer, ProcessingViewer, FailedViewer, ZetaSpreadsheetViewer,
 } from '@/components/kb/DocViewers'
 import type { DocumentListItem } from '@/lib/types'
 import type { SelectionGesture } from '@/components/kb/kb-detail/useBulkSelection'
@@ -248,7 +248,14 @@ export function FilesGrid({
   const [noteEditor, setNoteEditor] = React.useState<Editor | null>(null)
   const [noteTitle, setNoteTitle] = React.useState('')
   const noteTitleChangeRef = React.useRef<((title: string) => void) | null>(null)
-  React.useEffect(() => { setNoteEditor(null); setNoteTitle('') }, [activeDocId])
+  // A workbook normally opens in the ZetaOffice engine; the plain table is the escape hatch
+  // when the 53 MB WASM runtime cannot be fetched (air-gapped host, blocked CDN).
+  const [tableFallback, setTableFallback] = React.useState(false)
+  React.useEffect(() => {
+    setNoteEditor(null)
+    setNoteTitle('')
+    setTableFallback(false)
+  }, [activeDocId])
 
   const sourceDocs = React.useMemo(
     () => documents.filter((d) => (
@@ -768,6 +775,13 @@ export function FilesGrid({
             <PdfDocViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} initialPage={docInitialPage} hideToolbar />
           ) : ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'].includes(activeDoc.file_type) ? (
             <ImageViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} />
+          ) : ['xlsx', 'xls'].includes(activeDoc.file_type) && !tableFallback ? (
+            <ZetaSpreadsheetViewer
+              documentId={activeDoc.id}
+              title={activeDoc.title || activeDoc.filename}
+              filename={activeDoc.filename}
+              onFallback={() => setTableFallback(true)}
+            />
           ) : ['xlsx', 'xls', 'csv'].includes(activeDoc.file_type) ? (
             <ContentViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} fileType={activeDoc.file_type} />
           ) : (

@@ -189,6 +189,7 @@ function SpreadsheetView({ content }: { content: string }) {
 
 export function ContentViewer({ documentId, title, fileType }: { documentId: string; title: string; fileType: string }) {
   const token = useUserStore((s) => s.accessToken)
+
   const [content, setContent] = React.useState<string | null>(null)
   const [error, setError] = React.useState(false)
 
@@ -275,5 +276,86 @@ export function FailedViewer({ title, errorMessage }: { title: string; errorMess
         )}
       </div>
     </div>
+  )
+}
+
+/**
+ * Spreadsheet preview through ZetaOffice: LibreOffice compiled to WebAssembly runs inside the
+ * frame, so formulas, styling, merged cells and every row survive. `ContentViewer` only ever
+ * sees the stored text table, which the extractor truncates at 100 rows per sheet.
+ *
+ * The runtime is ~250 MiB on disk (~53 MB over the wire from the CDN) and is cached by the
+ * browser afterwards. When it cannot load — air-gapped host, blocked CDN, an unsupported
+ * container — the frame reports why and the caller switches to the plain table rather than
+ * leaving an empty panel.
+ */
+export function ZetaSpreadsheetViewer({
+  documentId, title, filename, onFallback,
+}: {
+  documentId: string
+  title: string
+  filename: string
+  onFallback: () => void
+}) {
+  const { url, error } = useDocumentUrl(documentId)
+  const [frameError, setFrameError] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    setFrameError(null)
+    const onMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return
+      const data = event.data as { type?: string; status?: string; message?: string } | null
+      if (data?.type !== 'llmwiki-zetaviewer') return
+      if (data.status === 'error') setFrameError(data.message || '表格引擎加载失败')
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [documentId])
+
+  // `name` carries the extension on purpose: LibreOffice picks its import filter from it.
+  const src = React.useMemo(() => {
+    if (!url) return null
+    const params = new URLSearchParams({ src: url, name: filename })
+    const base = process.env.NEXT_PUBLIC_ZETAOFFICE_BASE_URL
+    if (base) params.set('base', base)
+    return `/zetaviewer/index.html?${params.toString()}`
+  }, [url, filename])
+
+  if (error) return <ErrorMessage message="Failed to load spreadsheet" />
+  if (!src) return <LoadingSpinner />
+
+  if (frameError) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-3 p-8 text-center">
+        <FileText size={28} className="text-muted-foreground" />
+        <p className="text-sm font-medium">{title}</p>
+        <p className="max-w-md text-xs text-muted-foreground">{frameError}</p>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => setFrameError(null)}
+            className="rounded-md border border-border px-2.5 py-1 text-xs transition-colors hover:bg-accent"
+          >
+            重试
+          </button>
+          <button
+            type="button"
+            onClick={onFallback}
+            className="rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          >
+            改用表格视图
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <iframe
+      key={src}
+      src={src}
+      title={title}
+      className="h-full w-full border-0 bg-background"
+    />
   )
 }

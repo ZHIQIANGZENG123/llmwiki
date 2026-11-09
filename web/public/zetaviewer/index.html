@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spreadsheet preview</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; }
+  #qtcanvas {
+    /* Qt computes mouse coordinates from the canvas box, so it must carry no border or
+       padding. Qt also requires exactly this element id. */
+    border: 0; padding: 0; margin: 0;
+    width: 100%; height: 100%; display: block;
+    outline: none; visibility: hidden;
+  }
+  #status {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #52525b; background: #fff; text-align: center; padding: 24px;
+  }
+  #status .spinner {
+    width: 22px; height: 22px; border: 2px solid #d4d4d8; border-top-color: #71717a;
+    border-radius: 50%; animation: spin .9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #status.error .spinner { display: none; }
+  #status.error { color: #b91c1c; }
+  #status code { font-size: 11px; color: #71717a; word-break: break-all; }
+</style>
+</head>
+<body>
+<canvas id="qtcanvas" contenteditable="true" oncontextmenu="event.preventDefault()"></canvas>
+<div id="status"><div class="spinner"></div><div id="statusText">正在加载表格引擎…</div></div>
+
+<script type="text/javascript">
+'use strict';
+
+// Browser-side spreadsheet preview backed by ZetaOffice: LibreOffice compiled to WebAssembly,
+// so the file is rendered by the same engine that would open it on the desktop instead of by a
+// re-implementation that loses formulas, styles and everything past the first rows.
+//
+// Query parameters:
+//   src   absolute or same-origin URL of the workbook bytes (from /v1/documents/{id}/url)
+//   name  file name including the extension — LibreOffice picks its import filter from it
+//   base  optional runtime base URL holding soffice.js / .wasm / .data
+//
+// The parent frame is told when the document is on screen, or why it is not, so the app can
+// fall back to its plain table view.
+
+const params = new URLSearchParams(window.location.search);
+const src = params.get('src') || '';
+const name = params.get('name') || 'document.xlsx';
+const baseParam = params.get('base') || '';
+const CDN_BASE = 'https://cdn.zetaoffice.net/zetaoffice_latest/';
+
+const statusEl = document.getElementById('status');
+const statusText = document.getElementById('statusText');
+const canvas = document.getElementById('qtcanvas');
+
+function notify(status, detail) {
+  // Exposed for automated checks and for anyone debugging a stuck preview in devtools.
+  window.__llmwikiZeta = { status, ...detail };
+  // A preview failure must never trap the user inside the frame, so the parent decides.
+  window.parent.postMessage(
+    { type: 'llmwiki-zetaviewer', status, ...detail }, window.location.origin,
+  );
+}
+
+function fail(message) {
+  statusEl.classList.add('error');
+  statusText.textContent = message;
+  notify('error', { message });
+}
+
+function setStatus(text) {
+  statusText.textContent = text;
+}
+
+/** Prefer a self-hosted runtime, which is what an air-gapped install needs. */
+async function resolveBase() {
+  if (baseParam) return baseParam;
+  try {
+    const probe = await fetch('/zetaviewer/runtime/soffice.js', { method: 'HEAD' });
+    if (probe.ok) return '/zetaviewer/runtime/';
+  } catch (_) {
+    /* no local runtime; the CDN is the documented default */
+  }
+  return CDN_BASE;
+}
+
+async function fetchWorkbook() {
+  if (!src) throw new Error('缺少 src 参数');
+  const response = await fetch(src, { credentials: 'include' });
+  if (!response.ok) throw new Error('读取文件失败: HTTP ' + response.status);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+async function main() {
+  let bytes;
+  try {
+    bytes = await fetchWorkbook();
+  } catch (error) {
+    fail(error.message);
+    return;
+  }
+
+  // Absolute URLs throughout: the bootstrap runs in a blob web worker, where a host-relative
+  // path like `/zetaviewer/runtime/soffice.js` is not a resolvable URL.
+  const sofficeBaseUrl = new URL(await resolveBase(), window.location.href).href
+    .replace(/\/?$/, '/');
+  setStatus('正在加载表格引擎（首次约 53 MB，之后走浏览器缓存）…');
+
+  const Module = {
+    canvas,
+    // Resolved against this document, then handed to the worker as absolute URLs.
+    uno_scripts: [
+      new URL('zeta.js', window.location.href).href,
+      new URL('office_thread.js', window.location.href).href,
+    ],
+    locateFile: (path, prefix) => (prefix || sofficeBaseUrl) + path,
+  };
+  // Never point soffice.js at itself: when the base is set, the worker imports it from there.
+  Module.mainScriptUrlOrBlob = new Blob(
+    ["importScripts('" + sofficeBaseUrl + "soffice.js');"], { type: 'text/javascript' },
+  );
+
+  // The bundled runtime ships 138 fonts and not one of them covers CJK, so Chinese text
+  // renders as tofu. LibreOffice enumerates fonts during startup, so a face written after
+  // boot is never seen — it has to be in place before the engine comes up.
+  const cjkFont = await fetchCjkFont(sofficeBaseUrl);
+  if (cjkFont) {
+    Module.preRun = [function placeCjkFont() {
+      try {
+        FS.mkdirTree('/instdir/share/fonts/truetype');
+        FS.writeFile('/instdir/share/fonts/truetype/cjk.ttf', cjkFont);
+      } catch (error) {
+        console.warn('CJK font could not be installed:', error);
+      }
+    }];
+  }
+  window.Module = Module;
+
+  const script = document.createElement('script');
+  script.src = sofficeBaseUrl + 'soffice.js';
+  script.onerror = () => fail('无法下载表格引擎: ' + sofficeBaseUrl);
+  script.onload = () => {
+    Module.uno_main.then(async (port) => {
+      port.onmessage = (event) => {
+        switch (event.data.cmd) {
+        case 'ui_ready':
+          statusEl.style.display = 'none';
+          // Must be an explicit value: clearing the inline style would fall back to the
+          // stylesheet's `visibility: hidden` and the document would stay invisible.
+          canvas.style.visibility = 'visible';
+          // Qt lays out against the current box; tell it the canvas exists now.
+          window.dispatchEvent(new Event('resize'));
+          notify('ready', {});
+          break;
+        case 'fatal':
+          fail(event.data.message || '表格引擎加载失败');
+          break;
+        default:
+          break;
+        }
+      };
+
+      // Qt needs the file inside its own virtual filesystem before the model can be opened.
+      // Emscripten exports FS either globally or on Module depending on the build.
+      const fsApi = window.FS || Module.FS;
+      if (!fsApi) {
+        fail('表格引擎未提供文件系统接口');
+        return;
+      }
+      try {
+        try {
+          fsApi.mkdirTree('/tmp/office');
+        } catch (_) {
+          fsApi.mkdir('/tmp/office');  // already present on some builds
+        }
+        fsApi.writeFile('/tmp/office/' + name, bytes);
+      } catch (error) {
+        fail('写入临时文件失败: ' + error.message);
+        return;
+      }
+      setStatus('正在打开文档…');
+      port.postMessage({ cmd: 'open', filename: name });
+    }).catch((error) => fail('表格引擎启动失败: ' + error));
+  };
+  document.body.appendChild(script);
+}
+
+/** Optional CJK face dropped next to the runtime; absent is the normal case. */
+async function fetchCjkFont(sofficeBaseUrl) {
+  try {
+    const response = await fetch(sofficeBaseUrl + 'fonts/cjk.ttf');
+    if (!response.ok) return null;
+    return new Uint8Array(await response.arrayBuffer());
+  } catch (_) {
+    return null;
+  }
+}
+
+// Qt5 mis-reads mouse coordinates after a browser-zoom change unless the canvas is nudged.
+let lastDevicePixelRatio = window.devicePixelRatio;
+window.addEventListener('resize', () => {
+  if (lastDevicePixelRatio === window.devicePixelRatio) return;
+  lastDevicePixelRatio = window.devicePixelRatio;
+  canvas.style.width = canvas.clientWidth + 1 + 'px';
+  setTimeout(() => { canvas.style.width = '100%'; window.dispatchEvent(new Event('resize')); }, 100);
+});
+
+main();
+</script>
+</body>
+</html>

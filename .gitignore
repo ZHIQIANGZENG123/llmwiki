@@ -12,6 +12,10 @@ venv/
 # Generated: vendored by web/scripts/copy-pdf-worker.mjs on install and before build
 web/public/pdf.worker.min.mjs
 
+# ZetaOffice WebAssembly runtime (~53 MB), fetched by web/scripts/fetch-zetaoffice-runtime.mjs.
+# It is a build input for offline bundles, not source.
+web/public/zetaviewer/runtime/
+
 # MCP config (contains user IDs)
 .mcp.json
 
@@ -78,7 +82,15 @@ PRODUCT.md
 
 # --- Local build/ops artifacts (not part of the source) ---
 /.tmp/
-/.pi-agent/
+# The pi agent runtime is a 24 MB install tree, fetched per machine with npm.
+/.pi-runtime/
+# Everything in the agent dir is local scratch — auth.json holds credentials, work/ is the
+# chat agent's cwd — except the three files that configure it. Those carry no secrets: the
+# API key comes from DEEPSEEK_API_KEY and the MCP token from ${LLMWIKI_TOKEN}.
+/.pi-agent/*
+!/.pi-agent/models.json
+!/.pi-agent/mcp.json
+!/.pi-agent/APPEND_SYSTEM.md
 /web-patch/
 /bundle*/
 /devkit*/

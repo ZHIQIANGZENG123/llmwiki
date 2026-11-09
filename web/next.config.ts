@@ -53,6 +53,25 @@ const nextConfig: NextConfig = {
           },
         ],
       },
+      {
+        // The ZetaOffice viewer runs LibreOffice with pthreads, so it needs SharedArrayBuffer,
+        // which browsers only expose to a cross-origin isolated document. The runtime files are
+        // served either from this origin or from cdn.zetaoffice.net, which returns
+        // `Cross-Origin-Resource-Policy: cross-origin` — so `require-corp` does not block them.
+        source: "/zetaviewer/:path*",
+        headers: [
+          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+          { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
+        ],
+      },
+      {
+        // ~250 MiB of WebAssembly is fetched once per browser and must not be re-validated on
+        // every open. A week keeps an upgraded runtime from being pinned by a stale cache.
+        source: "/zetaviewer/runtime/:path*",
+        headers: [
+          { key: "Cache-Control", value: "public, max-age=604800" },
+        ],
+      },
     ];
   },
 };
