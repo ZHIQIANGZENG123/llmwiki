@@ -4,6 +4,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import date
 from pathlib import Path
@@ -50,6 +51,35 @@ No sources ingested yet - add your first source to get started.\
 def _fts5_keywords(query: str) -> str:
     """Quote each term so user text is matched as plain keywords (all must match), never parsed as FTS5 syntax."""
     return " ".join('"' + term.replace('"', '""') + '"' for term in query.split())
+
+
+# `chunks_fts` uses the `porter unicode61` tokenizer: it stems English, but an unbroken CJK
+# run is one token, so a Chinese query only matches a chunk equal to it byte for byte. Any
+# query carrying CJK therefore takes the LIKE path instead — the same substring matching the
+# web UI uses (`api/routes/local_search.py`), which finds a word mid-sentence.
+_CJK_PATTERN = re.compile(
+    "["
+    "\u3040-\u30ff"        # kana
+    "\u3400-\u4dbf"        # CJK extension A
+    "\u4e00-\u9fff"        # CJK unified ideographs
+    "\uac00-\ud7af"        # hangul syllables
+    "\uf900-\ufaff"        # CJK compatibility ideographs
+    "\U00020000-\U0002fa1f"  # extensions B..F and supplement
+    "]"
+)
+
+
+def _has_cjk(text: str) -> bool:
+    """True when the query carries CJK, which the FTS5 tokenizer cannot segment."""
+    return _CJK_PATTERN.search(text) is not None
+
+
+def _search_terms(query: str) -> list[str]:
+    return [term for term in query.split() if term]
+
+
+def _escape_like(term: str) -> str:
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
@@ -448,20 +478,21 @@ class SqliteVaultFS(VaultFS):
         annotated_only: bool = False,
         scope: str = "all",
     ) -> list[dict]:
-        fts_query = _fts5_keywords(query)
-        if not fts_query:
+        terms_lower = [term.lower() for term in _search_terms(query)]
+        if not terms_lower:
             return []
         # chunks_fts indexes only `content`, so scope filters run in Python; over-fetch 3x so narrow scopes still fill `limit`.
         sql_limit = limit if scope == "all" else limit * 3
-        rows = await self._select_chunk_matches(fts_query, path_filter, annotated_only, sql_limit)
+        rows = await self._select_chunk_matches(query, path_filter, annotated_only, sql_limit)
 
-        q_lower = query.lower()
         labeled: list[dict] = []
         for r in rows:
             src = (r.get("source_content") or "").lower()
             ann = (r.get("annotations_text") or "").lower()
-            source_hit = q_lower in src
-            annotation_hit = bool(ann) and q_lower in ann
+            # Every term is required by the query itself, so the same rule decides whether a
+            # chunk is reported as a source hit, an annotation hit, or both.
+            source_hit = all(term in src for term in terms_lower)
+            annotation_hit = bool(ann) and all(term in ann for term in terms_lower)
             if scope == "annotations" and not annotation_hit:
                 continue
             if scope == "source" and not source_hit:
@@ -658,8 +689,12 @@ class SqliteVaultFS(VaultFS):
             self.write_to_disk("/wiki/", "overview.md", overview)
 
     async def _select_chunk_matches(
-        self, fts_query: str, path_filter: str | None, annotated_only: bool, limit: int,
+        self, query: str, path_filter: str | None, annotated_only: bool, limit: int,
     ) -> list[dict]:
+        if _has_cjk(query):
+            return await self._select_chunk_like_matches(query, path_filter, annotated_only, limit)
+
+        fts_query = _fts5_keywords(query)
         db = self._db_or_raise()
         sql = (
             "SELECT dc.content, dc.source_content, dc.annotations_text, "
@@ -681,4 +716,90 @@ class SqliteVaultFS(VaultFS):
         sql += "ORDER BY rank LIMIT ?"
         params.append(limit)
         cursor = await db.execute(sql, params)
+        return _rows_to_dicts(cursor, await cursor.fetchall())
+
+    async def _select_chunk_like_matches(
+        self, query: str, path_filter: str | None, annotated_only: bool, limit: int,
+    ) -> list[dict]:
+        """Substring search for CJK queries, which the FTS5 tokenizer cannot segment.
+
+        Terms are AND-ed exactly as the FTS path's quoted keywords are, and `score` counts how
+        many of them occur in the chunk so the caller still gets a ranking to sort on.
+        """
+        db = self._db_or_raise()
+        terms = [_escape_like(term) for term in _search_terms(query)]
+        if not terms:
+            return []
+
+        columns = (
+            "dc.content, dc.source_content, dc.annotations_text, "
+            "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+            "d.filename, d.title, d.path, d.file_type, d.tags, d.document_number"
+        )
+        score_sql = " + ".join(
+            "(CASE WHEN dc.content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)" for _ in terms
+        )
+        clauses = ["d.status != 'failed'"]
+        clauses += ["dc.content LIKE ? ESCAPE '\\'" for _ in terms]
+        params: list = [f"%{term}%" for term in terms]  # SELECT placeholders come first
+        params += [f"%{term}%" for term in terms]
+        if annotated_only:
+            clauses.append("dc.has_highlight = 1")
+        if path_filter == "wiki":
+            clauses.append("d.source_kind = 'wiki'")
+        elif path_filter == "sources":
+            clauses.append("d.source_kind != 'wiki'")
+
+        cursor = await db.execute(
+            f"SELECT {columns}, ({score_sql}) AS score "
+            f"FROM document_chunks dc JOIN documents d ON dc.document_id = d.id "
+            f"WHERE {' AND '.join(clauses)} "
+            f"ORDER BY score DESC, d.document_number, dc.chunk_index LIMIT ?",
+            (*params, limit),
+        )
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+
+        # A source named `系统架构.pdf` whose body never repeats the term is still the answer,
+        # so titles and filenames match too — appended after content hits, one row per document.
+        if len(rows) < limit:
+            seen = {row["path"] + row["filename"] for row in rows}
+            rows += [
+                row for row in await self._select_title_matches(
+                    terms, path_filter, annotated_only, limit - len(rows),
+                )
+                if row["path"] + row["filename"] not in seen
+            ]
+        return rows
+
+    async def _select_title_matches(
+        self, escaped_terms: list[str], path_filter: str | None,
+        annotated_only: bool, limit: int,
+    ) -> list[dict]:
+        """Documents whose title or filename matches, represented by their first chunk."""
+        db = self._db_or_raise()
+        name_clauses = " AND ".join(
+            "(d.title LIKE ? ESCAPE '\\' OR d.filename LIKE ? ESCAPE '\\')" for _ in escaped_terms
+        )
+        clauses = ["d.status != 'failed'", name_clauses]
+        params: list = [f"%{term}%" for term in escaped_terms for _ in range(2)]
+        if annotated_only:
+            clauses.append("dc.has_highlight = 1")
+        if path_filter == "wiki":
+            clauses.append("d.source_kind = 'wiki'")
+        elif path_filter == "sources":
+            clauses.append("d.source_kind != 'wiki'")
+
+        cursor = await db.execute(
+            "SELECT dc.content, dc.source_content, dc.annotations_text, "
+            "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+            "d.filename, d.title, d.path, d.file_type, d.tags, d.document_number, "
+            "0 AS score "
+            "FROM documents d "
+            "JOIN document_chunks dc ON dc.id = ("
+            "  SELECT c.id FROM document_chunks c WHERE c.document_id = d.id "
+            "  ORDER BY c.chunk_index LIMIT 1) "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY d.document_number, d.filename LIMIT ?",
+            (*params, limit),
+        )
         return _rows_to_dicts(cursor, await cursor.fetchall())

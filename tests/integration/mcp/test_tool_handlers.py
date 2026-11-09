@@ -905,6 +905,60 @@ class TestSearchDeleteLifecycle:
         assert "paper.pdf" in result
         assert "notes.md" not in result
 
+    async def test_search_chunks_chinese_content(self, fs, insert_chunk):
+        """CJK cannot go through FTS5's porter tokenizer, so search falls back to substrings."""
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        await instance.create_document(kb_id, "design.md", "设计", "/", "md", "", ["arch"])
+        doc = await instance.get_document(kb_id, "design.md", "/")
+        await insert_chunk(str(doc["id"]), kb_id, "本文讨论微服务架构的演进路径")
+
+        result = await searcher.search_chunks("架构", "*", None, 10)
+        assert "design.md" in result
+        assert "微服务架构" in result
+
+    async def test_search_chunks_chinese_requires_every_term(self, fs, insert_chunk):
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        await instance.create_document(kb_id, "only-arch.md", "架构", "/", "md", "", ["arch"])
+        doc = await instance.get_document(kb_id, "only-arch.md", "/")
+        await insert_chunk(str(doc["id"]), kb_id, "本文讨论微服务架构的演进路径")
+
+        assert "only-arch.md" in await searcher.search_chunks("微服务 架构", "*", None, 10)
+        # The second term is absent, so AND semantics must reject the chunk.
+        assert "No matches" in await searcher.search_chunks("微服务 部署", "*", None, 10)
+
+    async def test_search_chunks_chinese_matches_title_only(self, fs, insert_chunk):
+        """A source named in Chinese whose body never repeats the phrase is still a hit."""
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        await instance.create_document(
+            kb_id, "系统架构.pdf", "系统架构设计说明", "/", "pdf", "", ["arch"],
+        )
+        doc = await instance.get_document(kb_id, "系统架构.pdf", "/")
+        await insert_chunk(str(doc["id"]), kb_id, "This document only contains English body text.")
+
+        result = await searcher.search_chunks("架构", "*", None, 10)
+        assert "系统架构.pdf" in result
+
+    async def test_search_chunks_english_still_uses_fts(self, fs, insert_chunk):
+        """The ASCII path must keep matching word variants, which LIKE would not."""
+        instance, kb_id = fs
+        from tools.search import SearchHandler
+
+        searcher = SearchHandler(instance, _make_kb(kb_id))
+        await instance.create_document(kb_id, "stem.md", "Stem", "/", "md", "", ["x"])
+        doc = await instance.get_document(kb_id, "stem.md", "/")
+        await insert_chunk(str(doc["id"]), kb_id, "the computing architecture")
+
+        assert "stem.md" in await searcher.search_chunks("compute", "*", None, 10)
+
     async def test_search_references_uncited(self, fs):
         instance, kb_id = fs
         from tools.search import SearchHandler

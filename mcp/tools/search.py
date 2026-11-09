@@ -10,14 +10,25 @@ _CONTEXT_CHARS = 120
 
 
 def _extract_snippet(content: str, query: str) -> str:
-    """Extract a context snippet around a query match."""
+    """Extract a context snippet around the earliest term, not the whole query string.
+
+    Multi-term queries (`系统 架构`) and CJK queries never occur verbatim, so looking for the
+    joined query would always fall back to the head of the chunk.
+    """
     if not content:
         return "(empty)"
-    idx = content.lower().find(query.lower())
-    if idx < 0:
+    lowered = content.lower()
+    position = -1
+    matched_len = 0
+    for term in query.split() or [query]:
+        found = lowered.find(term.lower())
+        if found != -1 and (position == -1 or found < position):
+            position = found
+            matched_len = len(term)
+    if position < 0:
         return content[:_CONTEXT_CHARS * 2].strip()
-    start = max(0, idx - _CONTEXT_CHARS)
-    end = min(len(content), idx + len(query) + _CONTEXT_CHARS)
+    start = max(0, position - _CONTEXT_CHARS)
+    end = min(len(content), position + matched_len + _CONTEXT_CHARS)
     snippet = content[start:end].strip()
     if start > 0:
         snippet = "..." + snippet

@@ -4,7 +4,8 @@ from pathlib import Path
 
 def _load_guide_text() -> str:
     guide_path = Path(__file__).resolve().parents[2] / "mcp" / "tools" / "guide.py"
-    module = ast.parse(guide_path.read_text())
+    # Explicit encoding: the source is UTF-8, while a Chinese Windows locale would default to GBK.
+    module = ast.parse(guide_path.read_text(encoding="utf-8"))
     for node in module.body:
         if not isinstance(node, ast.Assign):
             continue
